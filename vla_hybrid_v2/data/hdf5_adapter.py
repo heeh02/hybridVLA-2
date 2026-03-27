@@ -22,6 +22,7 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+from PIL import Image
 
 from vla_hybrid_v2.config import HybridVLAv2Config
 from vla_hybrid_v2.data.base_adapter import BaseDatasetAdapter
@@ -64,6 +65,8 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
         self.chunk_H = cfg.model.action_expert.chunk_horizon
         self.action_dim = cfg.model.action_expert.action_dim
         self.proprio_dim = cfg.model.proprio_dim
+        self.refresh_stride = cfg.train.semantic_refresh_stride
+        self.image_key = cfg.data.image_key  # e.g. "agentview_rgb"
 
         # Discover episode files
         data_dir = Path(self.dcfg.data_dir) if self.dcfg.data_dir else None
@@ -126,6 +129,67 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
     def episode_lengths(self) -> List[int]:
         return self._episode_lengths
 
+    # ------------------------------------------------------------------
+    # Image helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_image(data_grp, image_key: str, frame_idx: int) -> Optional[Image.Image]:
+        """Read a single RGB frame from HDF5 as PIL Image."""
+        if "images" not in data_grp:
+            return None
+        images_grp = data_grp["images"]
+        if image_key not in images_grp:
+            return None
+        raw = images_grp[image_key][frame_idx]  # [H, W, C] uint8
+        return Image.fromarray(raw)
+
+    def _process_text_image(
+        self, lang: str, pil_image: Optional[Image.Image],
+    ) -> dict:
+        """Tokenize text (+ image when available) via processor.
+
+        Returns dict with input_ids, attention_mask, and optionally
+        pixel_values / image_grid_thw.
+        """
+        if self.processor is not None and pil_image is not None:
+            # Joint text+image — Qwen2-VL processor handles image tokens
+            tok = self.processor(
+                text=lang, images=pil_image,
+                return_tensors="pt", padding="max_length",
+                truncation=True, max_length=256,
+            )
+            return {
+                "input_ids": tok["input_ids"].squeeze(0),
+                "attention_mask": tok["attention_mask"].squeeze(0),
+                "pixel_values": tok["pixel_values"].squeeze(0),
+                "image_grid_thw": tok["image_grid_thw"].squeeze(0),
+            }
+        elif self.processor is not None:
+            # Text-only (no image in HDF5)
+            tok = self.processor(
+                text=lang, return_tensors="pt", padding="max_length",
+                truncation=True, max_length=256,
+            )
+            return {
+                "input_ids": tok["input_ids"].squeeze(0),
+                "attention_mask": tok["attention_mask"].squeeze(0),
+                "pixel_values": None,
+                "image_grid_thw": None,
+            }
+        else:
+            # No processor — placeholder tokens (dummy / early dev)
+            return {
+                "input_ids": torch.zeros(256, dtype=torch.long),
+                "attention_mask": torch.ones(256, dtype=torch.long),
+                "pixel_values": None,
+                "image_grid_thw": None,
+            }
+
+    # ------------------------------------------------------------------
+    # __getitem__
+    # ------------------------------------------------------------------
+
     def __getitem__(self, idx: int) -> dict:
         ep_idx, start = self._index[idx]
         path = self.episode_paths[ep_idx]
@@ -152,6 +216,19 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
                 if isinstance(lang, bytes):
                     lang = lang.decode("utf-8")
 
+            # ---- v0.10.3 P0-B: Read observation image ----
+            # Use frame at START of window as the primary observation
+            primary_image = self._read_image(data, self.image_key, start)
+
+            # ---- v0.10.3 P0-B: Build refresh frames ----
+            refresh_steps = list(range(0, T, self.refresh_stride))
+            R = len(refresh_steps)
+            refresh_images: List[Optional[Image.Image]] = []
+            for r_step in refresh_steps:
+                refresh_images.append(
+                    self._read_image(data, self.image_key, start + r_step)
+                )
+
         # Normalize
         raw_actions_t = torch.from_numpy(raw_actions.astype(np.float32))
         raw_proprio_t = torch.from_numpy(raw_proprio.astype(np.float32))
@@ -170,23 +247,12 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
         if T > 1:
             prev_actions[1:] = norm_actions[:-1]
 
-        # Tokenize text (without vision for now)
-        # If processor is available, use it; otherwise generate placeholder tokens
-        if self.processor is not None:
-            tok = self.processor(
-                text=lang, return_tensors="pt", padding="max_length",
-                truncation=True, max_length=128,
-            )
-            input_ids = tok["input_ids"].squeeze(0)
-            attention_mask = tok["attention_mask"].squeeze(0)
-        else:
-            # Placeholder: will be overridden when processor is available
-            input_ids = torch.zeros(128, dtype=torch.long)
-            attention_mask = torch.ones(128, dtype=torch.long)
+        # ---- Primary observation tokenization (text + first-frame image) ----
+        primary_tok = self._process_text_image(lang, primary_image)
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
+        sample = {
+            "input_ids": primary_tok["input_ids"],
+            "attention_mask": primary_tok["attention_mask"],
             "actions": action_chunks,
             "proprio": norm_proprio,
             "prev_actions": prev_actions,
@@ -194,3 +260,31 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
                 self.dcfg.embodiment_id, dtype=torch.long
             ),
         }
+
+        # Add primary vision fields if available
+        if primary_tok["pixel_values"] is not None:
+            sample["pixel_values"] = primary_tok["pixel_values"]
+            sample["image_grid_thw"] = primary_tok["image_grid_thw"]
+
+        # ---- v0.10.3 P0-B: Refresh frame tokenization ----
+        # Only produce refresh fields when we have images AND R > 1
+        has_any_image = any(img is not None for img in refresh_images)
+        if self.processor is not None and R > 1 and has_any_image:
+            refresh_input_ids_list = []
+            refresh_attention_mask_list = []
+            refresh_pv_list: List[Optional[torch.Tensor]] = []
+            refresh_thw_list: List[Optional[torch.Tensor]] = []
+
+            for img in refresh_images:
+                tok = self._process_text_image(lang, img)
+                refresh_input_ids_list.append(tok["input_ids"])
+                refresh_attention_mask_list.append(tok["attention_mask"])
+                refresh_pv_list.append(tok["pixel_values"])
+                refresh_thw_list.append(tok["image_grid_thw"])
+
+            sample["refresh_input_ids"] = torch.stack(refresh_input_ids_list)       # [R, L]
+            sample["refresh_attention_mask"] = torch.stack(refresh_attention_mask_list)  # [R, L]
+            sample["refresh_pixel_values_list"] = refresh_pv_list    # List[Tensor], len=R
+            sample["refresh_image_grid_thw_list"] = refresh_thw_list  # List[Tensor], len=R
+
+        return sample

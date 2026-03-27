@@ -46,4 +46,6 @@
 | [optimize_v0_10.md](optimize_v0_10.md) | v0.10 | Data layer fixes: schema name mismatch, short-episode bug, inheritance, HDF5 validation, collate None, normalizer warnings, compute_stats script. |
 | [analysis_v0_10_1.md](analysis_v0_10_1.md) | v0.10.1 | Claude x GPT cross-audit: chunk supervision bug (P0-3), stats coupling, 5 new findings. |
 | [optimize_v0_10_1.md](optimize_v0_10_1.md) | v0.10.1 | Critical: action chunk supervision fix (T+H-1 read), stats path decoupling, batch device transfer, affordance labels, normalizer warnings. |
-| **[optimize_v0_10_2.md](optimize_v0_10_2.md)** | **v0.10.2** | **5 fixes: num_affordance_types configurable, _to_device out of loop, step_weights validation, smoke test doc, remove redundant .to(device).** |
+| [optimize_v0_10_2.md](optimize_v0_10_2.md) | v0.10.2 | 5 fixes: num_affordance_types configurable, _to_device out of loop, step_weights validation, smoke test doc, remove redundant .to(device). |
+| [analysis_v0_10_3.md](analysis_v0_10_3.md) | v0.10.3 | Claude x GPT deep cross-audit: single-step supervision (P1-C), processor disconnected (P0-A), no vision (P0-B). Score reconciliation 6.8/10. |
+| **[optimize_v0_10_3.md](optimize_v0_10_3.md)** | **v0.10.3** | **5 critical fixes: connect Processor, HDF5 image reading, multi-step supervision, unified training script (Stage A/B/C), eval loop.** |

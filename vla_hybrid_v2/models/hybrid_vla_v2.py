@@ -470,45 +470,61 @@ class HybridVLAv2(nn.Module):
         fused_states = torch.stack(fused_states_list, dim=1)
         fast_tokens = torch.stack(fast_tokens_list, dim=1)
 
-        # ---- Losses ----
+        # ---- Losses (v0.10.3 P1-C: multi-step supervision) ----
+        # Supervise FAST/phase/affordance at ALL T timesteps to improve
+        # gradient density. Expert loss stays at t=-1 (expensive, Stage B/C).
         losses: Dict[str, Tensor] = {}
         weights = self.cfg.train.loss_weights
+        _lo, _hi = self.cfg.model.heads.action_range
+        _V = self.cfg.model.heads.fast_vocab_size
 
-        target_actions = batch["actions"][:, -1]  # [B, H, A]
+        # fast_continuous at last step — needed for consistency loss
         fast_continuous: Optional[Tensor] = None
 
-        # FAST discrete loss
+        # FAST discrete loss — all T steps
         if self.fast_head is not None:
-            fast_logits = self.fast_head(fused_states[:, -1])
-            # v0.9.2: action_range from config (matches _fast_bin_centers)
-            _lo, _hi = self.cfg.model.heads.action_range
-            fast_targets = FASTDiscreteHead.discretise_actions(
-                target_actions, lo=_lo, hi=_hi,
-                V=self.cfg.model.heads.fast_vocab_size,
-            )
-            losses["loss_fast"] = self.discrete_loss(fast_logits, fast_targets) * weights.get("fast_discrete", 1.0)
-            # v0.5 fix: softmax expected value (differentiable)
-            # v0.6 fix: use registered buffer (avoid per-forward allocation)
-            fast_probs = fast_logits.softmax(dim=-1)  # [B, H, A, V]
+            # Vectorised: reshape [B, T, D] → [B*T, D], head outputs [B*T, H, A, V]
+            BT = B * T
+            fast_logits_flat = self.fast_head(fused_states.reshape(BT, -1))  # [B*T, H, A, V]
+            fast_targets_flat = FASTDiscreteHead.discretise_actions(
+                batch["actions"], lo=_lo, hi=_hi, V=_V,
+            ).reshape(BT, self.cfg.model.action_expert.chunk_horizon, -1)    # [B*T, H, A]
+            losses["loss_fast"] = self.discrete_loss(
+                fast_logits_flat, fast_targets_flat,
+            ) * weights.get("fast_discrete", 1.0)
+            # fast_continuous at last step for consistency
+            fast_logits_last = fast_logits_flat.reshape(
+                B, T, *fast_logits_flat.shape[1:]
+            )[:, -1]                                                  # [B, H, A, V]
+            fast_probs = fast_logits_last.softmax(dim=-1)
             fast_continuous = (fast_probs * self._fast_bin_centers).sum(dim=-1)
 
-        # Phase loss
+        # Phase loss — all T steps
         if self.phase_head is not None and "phase_labels" in batch:
-            last_grounder = grounder_outputs[-1]
-            phase_logits = self.phase_head(last_grounder.phase_token)
-            losses["loss_phase"] = self.phase_loss(
-                phase_logits, batch["phase_labels"][:, -1]
-            ) * weights.get("phase", 0.5)
+            phase_losses = []
+            for t_sup in range(T):
+                r = refresh_map[t_sup]
+                phase_logits_t = self.phase_head(grounder_outputs[r].phase_token)
+                phase_loss_t = self.phase_loss(
+                    phase_logits_t, batch["phase_labels"][:, t_sup],
+                )
+                phase_losses.append(phase_loss_t)
+            losses["loss_phase"] = torch.stack(phase_losses).mean() * weights.get("phase", 0.5)
 
-        # Affordance loss
+        # Affordance loss — all T steps
         if self.affordance_head is not None and "affordance_labels" in batch:
-            last_grounder = grounder_outputs[-1]
-            aff_logits = self.affordance_head(last_grounder.affordance_token)
-            losses["loss_affordance"] = nn.functional.cross_entropy(
-                aff_logits, batch["affordance_labels"][:, -1]
-            ) * weights.get("affordance", 0.3)
+            aff_losses = []
+            for t_sup in range(T):
+                r = refresh_map[t_sup]
+                aff_logits_t = self.affordance_head(grounder_outputs[r].affordance_token)
+                aff_loss_t = nn.functional.cross_entropy(
+                    aff_logits_t, batch["affordance_labels"][:, t_sup],
+                )
+                aff_losses.append(aff_loss_t)
+            losses["loss_affordance"] = torch.stack(aff_losses).mean() * weights.get("affordance", 0.3)
 
-        # ---- Stage-gated action expert ----
+        # ---- Stage-gated action expert (t=-1 only) ----
+        target_actions = batch["actions"][:, -1]  # [B, H, A]
         if stage != "a":
             last_grounder = grounder_outputs[-1]
             cond_prefix = self._build_cond_prefix(last_grounder, temporal_outputs[-1])

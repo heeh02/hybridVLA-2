@@ -1,18 +1,19 @@
-"""Stage A training script for HybridVLA v2.
+"""Unified training script for HybridVLA v2 — Stage A / B / C.
 
-Trains: backbone LoRA + Grounder + Tri-Rate Core + discrete heads.
-Frozen: Action Expert.
+v0.10.3: replaces stage-specific scripts with a single entry point.
 
-Features: cosine LR schedule with warmup, gradient accumulation,
-FSDP support, EMA (optional), checkpoint save/load, auto-resume.
+Stage semantics:
+- A: backbone LoRA + grounder + tri-rate core + discrete heads. Expert frozen.
+- B: adds expert (cond_prefix.detach()). EMA starts.
+- C: full fine-tune with RTC/FASTER.
 
 Usage:
-    # Single GPU:
-    python -m scripts.train_stage_a --config configs/train/stage_a.yaml
+    # Single GPU, Stage A:
+    python -m scripts.train_unified --config configs/train/stage_a.yaml
 
-    # Multi-GPU:
-    torchrun --nproc_per_node=8 -m scripts.train_stage_a \\
-        --config configs/train/stage_a.yaml
+    # Multi-GPU, Stage B from Stage A checkpoint:
+    torchrun --nproc_per_node=8 -m scripts.train_unified \
+        --config configs/train/stage_b.yaml
 """
 
 from __future__ import annotations
@@ -23,9 +24,10 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from vla_hybrid_v2.config import HybridVLAv2Config, load_config
@@ -79,6 +81,52 @@ def setup_logging(log_dir: Optional[str] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Eval
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate(
+    model: torch.nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+    cfg: HybridVLAv2Config,
+    max_batches: int = 50,
+) -> Dict[str, float]:
+    """Run offline evaluation and return aggregated metrics.
+
+    Computes average loss components over up to `max_batches` validation
+    batches. Returns a dict of metric_name -> value.
+    """
+    model.eval()
+    accum: Dict[str, float] = {}
+    count = 0
+
+    def _to_device(v):
+        if isinstance(v, torch.Tensor):
+            return v.to(device, non_blocking=True)
+        if isinstance(v, list):
+            return [_to_device(x) for x in v]
+        return v
+
+    for batch_idx, batch in enumerate(val_loader):
+        if batch_idx >= max_batches:
+            break
+        batch = {k: _to_device(v) for k, v in batch.items()}
+
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=cfg.train.bf16):
+            losses = model.forward_train(batch)
+
+        for k, v in losses.items():
+            accum[k] = accum.get(k, 0.0) + v.item()
+        count += 1
+
+    model.train()
+    if count == 0:
+        return {}
+    return {k: v / count for k, v in accum.items()}
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -86,8 +134,9 @@ def train(cfg: HybridVLAv2Config) -> None:
     local_rank = setup_distributed(seed=42)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     setup_logging(cfg.train.output_dir)
+    stage = cfg.stage
 
-    logger.info("Stage A training — v2 Tri-Rate + Hierarchical Grounder")
+    logger.info("Unified training — Stage %s | v2 Tri-Rate + Hierarchical Grounder", stage.upper())
     logger.info("World size: %d, local rank: %d, device: %s",
                 get_world_size(), local_rank, device)
 
@@ -95,9 +144,17 @@ def train(cfg: HybridVLAv2Config) -> None:
     from vla_hybrid_v2.models.hybrid_vla_v2 import HybridVLAv2
     model = HybridVLAv2(cfg)
 
-    # Freeze action expert in Stage A
-    for p in model.action_expert.parameters():
-        p.requires_grad = False
+    # Stage-gated freezing
+    if stage == "a":
+        for p in model.action_expert.parameters():
+            p.requires_grad = False
+        logger.info("Stage A: action_expert frozen.")
+    elif stage == "b":
+        # Expert unfrozen; backbone LoRA stays trainable
+        logger.info("Stage B: all trainable (expert unfrozen, cond_prefix detached).")
+    else:
+        # Stage C: full fine-tune
+        logger.info("Stage C: full fine-tune.")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -111,7 +168,7 @@ def train(cfg: HybridVLAv2Config) -> None:
         model = wrap_fsdp(model, mixed_precision=cfg.train.bf16,
                           use_activation_checkpointing=cfg.train.checkpointing)
 
-    # ---- Optimizer (v0.9.1: exclude res_scale/bias/LN from weight decay) ----
+    # ---- Optimizer (exclude res_scale/bias/LN from weight decay) ----
     no_decay_keywords = {"bias", "res_scale", "LayerNorm.weight", "layer_norm.weight"}
     decay_params = []
     no_decay_params = []
@@ -138,7 +195,7 @@ def train(cfg: HybridVLAv2Config) -> None:
         total_steps=cfg.train.max_steps,
     )
 
-    # ---- EMA ----
+    # ---- EMA (typically enabled from Stage B) ----
     ema = None
     if cfg.model.ema.enable:
         from vla_hybrid_v2.utils.ema import EMAModel
@@ -147,12 +204,14 @@ def train(cfg: HybridVLAv2Config) -> None:
             final_decay=cfg.model.ema.final_decay,
             ramp_steps=cfg.model.ema.ramp_steps,
         )
+        logger.info("EMA enabled (decay %.4f → %.4f over %d steps)",
+                     cfg.model.ema.initial_decay, cfg.model.ema.final_decay,
+                     cfg.model.ema.ramp_steps)
 
-    # ---- Cross-stage checkpoint loading (v0.9) ----
+    # ---- Cross-stage checkpoint loading ----
     if cfg.train.resume_from:
-        from pathlib import Path as _Path
         from vla_hybrid_v2.utils.checkpointing import load_checkpoint
-        _resume_path = _Path(cfg.train.resume_from)
+        _resume_path = Path(cfg.train.resume_from)
         if _resume_path.is_symlink():
             _resume_path = _resume_path.resolve()
         if not (_resume_path / "model.pt").exists():
@@ -163,8 +222,6 @@ def train(cfg: HybridVLAv2Config) -> None:
             )
         logger.info("Loading cross-stage checkpoint: %s", _resume_path)
         load_checkpoint(_resume_path, model, strict=False)
-        # Do NOT load optimizer/scheduler from prior stage — they have
-        # different total_steps and LR configs.
 
     # ---- Auto-resume (same-stage) ----
     start_step, start_epoch = auto_resume(
@@ -172,17 +229,16 @@ def train(cfg: HybridVLAv2Config) -> None:
         map_location=f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu",
     )
 
-    # ---- Data (v0.9.3: uses data module) ----
-    # v0.10.3 P0-A: connect Qwen2-VL processor for real tokenization.
-    # Without this, input_ids are all zeros → backbone produces identical
-    # hidden states regardless of instruction → grounder cannot learn.
+    # ---- Processor (v0.10.3 P0-A) ----
     processor = None
     if cfg.data.format and cfg.data.format != "dummy":
         from transformers import AutoProcessor
         processor = AutoProcessor.from_pretrained(cfg.model.backbone.name)
         logger.info("Loaded processor: %s", cfg.model.backbone.name)
+
+    # ---- Data ----
     dataset, collate_fn = build_dataset(cfg, split="train", processor=processor)
-    logger.info("Dataset: %s (%d samples)", type(dataset).__name__, len(dataset))
+    logger.info("Train dataset: %s (%d samples)", type(dataset).__name__, len(dataset))
     sampler = (
         torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
         if get_world_size() > 1 else None
@@ -194,6 +250,20 @@ def train(cfg: HybridVLAv2Config) -> None:
         collate_fn=collate_fn,
     )
 
+    # ---- Validation DataLoader (v0.10.3 P1-E) ----
+    val_loader = None
+    try:
+        val_dataset, val_collate_fn = build_dataset(cfg, split="val", processor=processor)
+        if len(val_dataset) > 0:
+            val_loader = DataLoader(
+                val_dataset, batch_size=cfg.train.per_device_batch_size,
+                shuffle=False, num_workers=1, pin_memory=True,
+                drop_last=False, collate_fn=val_collate_fn,
+            )
+            logger.info("Val dataset: %s (%d samples)", type(val_dataset).__name__, len(val_dataset))
+    except (FileNotFoundError, ValueError):
+        logger.info("No validation dataset found — eval disabled.")
+
     # ---- Training ----
     model.train()
     global_step = start_step
@@ -202,16 +272,16 @@ def train(cfg: HybridVLAv2Config) -> None:
     accum_loss: Dict[str, float] = {}
     grad_accum = cfg.train.grad_accum_steps
 
+    def _to_device(v):
+        if isinstance(v, torch.Tensor):
+            return v.to(device, non_blocking=True)
+        if isinstance(v, list):
+            return [_to_device(x) for x in v]
+        return v
+
     for epoch in range(start_epoch, 9999):
         if sampler is not None:
             sampler.set_epoch(epoch)
-
-        def _to_device(v):
-            if isinstance(v, torch.Tensor):
-                return v.to(device, non_blocking=True)
-            if isinstance(v, list):
-                return [_to_device(x) for x in v]
-            return v
 
         for batch_idx, batch in enumerate(loader):
             if global_step >= cfg.train.max_steps:
@@ -249,26 +319,35 @@ def train(cfg: HybridVLAv2Config) -> None:
                     accum_loss.clear()
                     step_start = time.monotonic()
 
+                # Eval (v0.10.3 P1-E)
+                if (val_loader is not None
+                        and global_step % cfg.train.eval_interval == 0
+                        and is_main_process()):
+                    metrics = evaluate(model, val_loader, device, cfg)
+                    parts = " | ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+                    logger.info("Eval step %d | %s", global_step, parts)
+
                 # Checkpoint
                 if global_step % cfg.train.save_interval == 0:
                     save_checkpoint(model, optimizer, global_step,
                                     cfg.train.output_dir, epoch=epoch,
                                     scheduler=scheduler, ema=ema,
-                                    extra={"stage": "a"})
+                                    extra={"stage": stage})
 
         if global_step >= cfg.train.max_steps:
             break
 
     save_checkpoint(model, optimizer, global_step, cfg.train.output_dir,
                     epoch=epoch, scheduler=scheduler, ema=ema,
-                    extra={"stage": "a", "final": True})
-    logger.info("Stage A complete at step %d.", global_step)
+                    extra={"stage": stage, "final": True})
+    logger.info("Stage %s complete at step %d.", stage.upper(), global_step)
     cleanup_distributed()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="HybridVLA v2 Stage A")
-    parser.add_argument("--config", type=str, default="configs/train/stage_a.yaml")
+    parser = argparse.ArgumentParser(description="HybridVLA v2 Unified Training")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to YAML config (must include 'stage: a|b|c')")
     args = parser.parse_args()
     cfg = load_config(args.config)
     train(cfg)
