@@ -4,7 +4,7 @@
 
 HybridVLA v2 is a vision-language-action (VLA) architecture that addresses a fundamental tension in robotic control: reactive low-level motor commands need high-frequency updates (~50 Hz), while semantic understanding of the scene — "which object to pick," "where to place it" — changes slowly (~12.5 Hz). Existing VLA models either process everything at a single rate (wasting compute on redundant semantic re-encoding) or use a dual-rate design with a large frequency gap that loses mid-frequency dynamics.
 
-HybridVLA v2 solves this with a **tri-rate Mamba temporal core** — three parallel state-space model streams operating at 50 Hz, 25 Hz, and 12.5 Hz, fused via cross-attention rather than scalar gating. Combined with a 7B vision-language backbone, a flow-matching action expert with multiplicative timestep conditioning, and a latent world model, the architecture targets 8xH100 80GB SXM clusters (~9B total parameters, ~1.5B trainable).
+HybridVLA v2 solves this with a **tri-rate Mamba temporal core** — three parallel state-space model streams operating at 50 Hz, 25 Hz, and 12.5 Hz, fused via cross-attention rather than scalar gating. Combined with a 7B vision-language backbone and a flow-matching action expert with multiplicative timestep conditioning, the architecture targets 8xH100 80GB SXM clusters (~9B total parameters, ~1.5B trainable).
 
 ## Table of Contents
 
@@ -15,7 +15,7 @@ HybridVLA v2 solves this with a **tri-rate Mamba temporal core** — three paral
   - [Tri-Rate Mamba Temporal Core](#3-tri-rate-mamba-temporal-core)
   - [Flow-Matching Action Expert](#4-flow-matching-action-expert-with-adarmsnorm)
   - [Hybrid Action Heads](#5-hybrid-action-heads)
-  - [Latent World Model](#6-latent-world-model)
+  - [World Model (TODO)](#6-world-model-todo)
 - [Training Strategy](#training-strategy)
 - [Inference Pipeline](#inference-pipeline)
 - [Parameter Budget](#parameter-budget)
@@ -37,8 +37,7 @@ The design is driven by three observations:
 ## Architecture
 
 ```
-                    Multi-Camera RGB (wrist, shoulder, overhead)
-                              + Language Instruction
+                         RGB Image + Language Instruction
                                        |
                           Qwen2-VL-7B Backbone (frozen + LoRA)
                          Multi-scale features [L10, L18, L28]
@@ -89,7 +88,7 @@ A `MultiScaleAdapter` inspired by FPN projects each layer's output from 3584d to
 
 **LoRA** (rank=64, alpha=128) is applied to all 28 layers' attention and MLP projections (q/k/v/o/gate/up/down), injecting ~90M trainable parameters into the 7.6B frozen backbone. This is a deliberate departure from v1's conservative approach of LoRA on only the last 8 layers — full-layer adaptation allows even early visual features to shift toward robotic manipulation distributions.
 
-**Multi-camera** inputs (wrist, shoulder, overhead) are processed independently through the backbone and concatenated before the grounder, providing multi-view spatial reasoning without architectural changes.
+**Multi-camera** support (wrist, shoulder, overhead) is architecturally designed but not yet enabled in the current version (`multi_camera.enable = false`). When activated, each camera's input will be processed independently through the backbone and concatenated before the grounder.
 
 ### 2. Hierarchical Attention Grounder
 
@@ -166,18 +165,17 @@ Additional heads:
 - **Phase head** (16 classes): Predicts the current manipulation phase (approach, grasp, lift, transport, place, etc.)
 - **Affordance head**: Predicts object affordance types relevant to the current task
 
-### 6. Latent World Model
+### 6. World Model (TODO)
 
-An optional DreamerV3-inspired imagination engine that predicts future latent states, enabling the agent to evaluate action consequences before execution:
+A DreamerV3-inspired latent world model is planned but **not yet enabled** (`world_model.enable = false`). The code scaffold exists in `vla_hybrid_v2/world_model/` and includes:
 
-- **StochasticStateModule**: Categorical latent variables (48 categories x 48 classes) with separate prior/posterior encoding, enabling multi-modal state predictions
-- **ImaginationMamba**: 8-layer Mamba stack (d_state=128) for latent dynamics transitions with explicit state persistence across imagination steps
-- **ObjectPhysicsEngine**: GNN-based (6 layers) object interaction modeling with intrinsic property prediction and interaction weight estimation
-- **NoiseAugmentation**: Schedule-aware noise injection during imagination rollouts to prevent compounding errors
-- **CNNWorldDecoder**: Optional visual prediction for auxiliary supervision
-- **LatentSubgoalPlanner**: Proposes intermediate latent goals for long-horizon tasks
+- `ImaginationEngine` — 32-step latent rollout orchestrator
+- `ImaginationMamba` — 8-layer Mamba for latent dynamics
+- `StochasticStateModule` — categorical latent variables (prior/posterior)
+- `ObjectPhysicsEngine` — GNN-based object interaction modeling
+- `CNNWorldDecoder`, `LatentSubgoalPlanner`, `WorldModelLoss`
 
-The imagination engine performs 32-step rollouts, collecting full loss data (reward/value logits, prior distributions, physics outputs, visual predictions) for end-to-end training via `WorldModelLoss` with free-bits KL and categorical cross-entropy.
+These components are architecturally integrated (the main model has `get_world_model_state()` interface) but have not been trained or validated. Enabling the world model and integrating it into the training loop is a future work item.
 
 ## Training Strategy
 
@@ -189,7 +187,13 @@ Three-stage progressive training with gradient isolation:
 | **B** | 200K | 1e-4 | + Flow Expert + EMA starts | `cond_prefix.detach()` — expert trains with frozen condition representations, preventing flow-matching gradients from destabilizing the backbone. |
 | **C** | 80K | 3e-5 | All components + RTC + FASTER | End-to-end fine-tuning with receding-horizon temporal consistency (RTC) and near/far step scheduling (FASTER). Lower LR preserves learned representations. |
 
+**Per-component LR scaling** (v0.10.5): backbone LoRA uses `learning_rate * 0.1`, action expert uses `learning_rate * 0.5`, preventing the pre-trained backbone from drifting too fast while allowing the randomly-initialized expert to converge quickly.
+
+**Multi-step supervision** (v0.10.3): FAST discrete, phase, and affordance losses are computed at all T timesteps in the training window (not just the last step), increasing gradient density for the perception modules. The flow-matching expert loss remains at `t=-1` only due to its computational cost.
+
 **Global batch size = 64** (2 per GPU x 8 GPUs x 4 gradient accumulation steps). **EMA** with decay ramping from 0.999 to 0.9999 over 20K steps, starting at Stage B.
+
+All three stages are managed by a single unified training script (`scripts/train_unified.py`) with automatic stage detection from config, validation evaluation, and checkpoint resumption.
 
 ## Inference Pipeline
 
@@ -226,7 +230,8 @@ hybridVLA_2/
     model/                     # Architecture configs (YAML)
     train/                     # Per-stage training configs (stage_a/b/c.yaml)
   scripts/
-    train_stage_a.py           # Training entry point
+    train_unified.py           # Unified training entry point (Stage A/B/C)
+    train_stage_a.py           # Legacy single-stage script
     train_smoke_test.py        # Config + forward pass validation
     compute_stats.py           # Dataset normalization statistics
   vla_hybrid_v2/
@@ -235,7 +240,7 @@ hybridVLA_2/
     types.py                   # Core types: GrounderOutput, TriRateTemporalState, etc.
     models/
       hybrid_vla_v2.py         # Top-level model: forward_train + control_step
-      qwen2vl_backbone.py      # 7B backbone + MultiScaleAdapter + multi-camera
+      qwen2vl_backbone.py      # 7B backbone + MultiScaleAdapter
       attention_grounder.py    # Hierarchical 96-latent grounder + SlotCompression
       mamba_core.py            # Tri-Rate Mamba (Fast/Medium/Slow) + CrossAttentionFusion
       flow_action_expert.py    # 18L AdaRMSNorm expert + Euler/Midpoint samplers
@@ -244,7 +249,7 @@ hybridVLA_2/
       flow_matching.py         # Rectified Flow MSE loss + logit-normal timestep sampling
       discrete_loss.py         # Cross-entropy with label smoothing
       consistency_loss.py      # Contrastive temporal + slow-fast agreement + action consistency
-    world_model/
+    world_model/               # TODO: not yet enabled (enable: false)
       imagination_engine.py    # 32-step imagination rollout orchestrator
       imagination_mamba.py     # 8L Mamba for latent dynamics
       stochastic_state.py      # Categorical latent variables (prior/posterior)
@@ -259,16 +264,16 @@ hybridVLA_2/
     data/
       schema.py                # Episode schema + validation
       base_adapter.py          # Abstract dataset adapter
-      hdf5_adapter.py          # HDF5 episode loading
+      hdf5_adapter.py          # HDF5 episode loading with image reading + processor tokenization
       normalizer.py            # Per-field running statistics
-      collate.py               # Multi-camera batch collation
+      collate.py               # Vision-aware batch collation with variable patch padding
       dummy.py                 # Synthetic data for smoke tests
     infer/                     # Runtime inference loop (WIP)
     utils/
       checkpointing.py         # Save/load with stage awareness
       distributed.py           # FSDP helpers
       ema.py                   # Exponential moving average with decay ramp
-  docs/                        # Design documents and iteration history (v0.1 - v0.10.2)
+  docs/                        # Design documents and iteration history (v0.1 - v0.10.5)
 ```
 
 ## Hardware Requirements
@@ -278,12 +283,13 @@ hybridVLA_2/
 
 ## Status
 
-The model architecture (v0.10.2) has been through 10+ iterations of cross-audits (Claude + GPT) and is considered mature. Current development priorities:
+The model architecture (v0.10.5) has been through 15+ iterations of cross-audits (Claude + GPT) and is considered training-ready. The data pipeline now supports HDF5 episodes with real image reading and Qwen2-VL processor tokenization. Current development priorities:
 
-- Data pipeline integration with real robot datasets (LIBERO, Calvin, DROID)
+- Training on real robot datasets (LIBERO, Calvin, DROID) and hyperparameter tuning
 - Evaluation framework and benchmark suite
+- Multi-camera adapter implementation
+- World model training loop integration
 - Runtime inference optimization and `torch.compile` integration
-- World model training loop
 
 ## Collaboration
 
@@ -306,7 +312,7 @@ This project is currently unlicensed. Please contact the author before using any
 
 HybridVLA v2 是一个视觉-语言-动作 (VLA) 架构，旨在解决机器人控制中的一个根本矛盾：底层运动控制需要高频更新（~50 Hz），而场景的语义理解——"抓哪个物体""放到哪里"——变化缓慢（~12.5 Hz）。现有 VLA 模型要么以单一频率处理所有信息（在冗余的语义重编码上浪费算力），要么使用双频设计但频率间隔过大，丢失了中频动态。
 
-HybridVLA v2 通过**三频 Mamba 时序核心**解决这一问题——三条并行的状态空间模型流分别以 50 Hz、25 Hz 和 12.5 Hz 运行，并通过交叉注意力而非标量门控进行融合。结合 7B 视觉语言骨干、乘法时间步条件化的 Flow Matching 动作专家，以及潜在世界模型，整体架构面向 8×H100 80GB SXM 集群（总参数约 9B，可训练约 1.5B）。
+HybridVLA v2 通过**三频 Mamba 时序核心**解决这一问题——三条并行的状态空间模型流分别以 50 Hz、25 Hz 和 12.5 Hz 运行，并通过交叉注意力而非标量门控进行融合。结合 7B 视觉语言骨干和乘法时间步条件化的 Flow Matching 动作专家，整体架构面向 8×H100 80GB SXM 集群（总参数约 9B，可训练约 1.5B）。
 
 ## 目录
 
@@ -317,7 +323,7 @@ HybridVLA v2 通过**三频 Mamba 时序核心**解决这一问题——三条�
   - [三频 Mamba 时序核心](#3-三频-mamba-时序核心)
   - [Flow Matching 动作专家](#4-adarmsnorm-flow-matching-动作专家)
   - [混合动作头](#5-混合动作头)
-  - [潜在世界模型](#6-潜在世界模型)
+  - [世界模型 (TODO)](#6-世界模型-todo)
 - [训练策略](#训练策略)
 - [推理管线](#推理管线)
 - [参数预算](#参数预算)
@@ -336,8 +342,7 @@ HybridVLA v2 通过**三频 Mamba 时序核心**解决这一问题——三条�
 ## 架构详解
 
 ```
-                    多相机 RGB（腕部、肩部、俯视）
-                         + 语言指令
+                    RGB 图像 + 语言指令
                               |
                      Qwen2-VL-7B 骨干（冻结 + LoRA）
                     多尺度特征 [L10, L18, L28]
@@ -389,7 +394,7 @@ HybridVLA v2 通过**三频 Mamba 时序核心**解决这一问题——三条�
 
 **LoRA**（rank=64, alpha=128）应用于全部 28 层的注意力和 MLP 投影（q/k/v/o/gate/up/down），在 7.6B 冻结骨干中注入约 90M 可训练参数。与 v1 仅在最后 8 层使用 LoRA 的保守策略不同，全层适应使早期视觉特征也能向机器人操作数据分布偏移。
 
-**多相机**输入（腕部、肩部、俯视）独立通过骨干处理并在 Grounder 前拼接。
+**多相机**支持（腕部、肩部、俯视）已在架构上设计但当前版本尚未启用（`multi_camera.enable = false`）。启用后，各相机输入将独立通过骨干处理并在 Grounder 前拼接。
 
 ### 2. 层次注意力 Grounder
 
@@ -448,18 +453,17 @@ output = sigmoid(gate) * ((1 + scale) * RMSNorm(x) + shift)
 - **慢-快一致性损失**：约束慢速流输出近似近期快速流输出的指数移动平均，防止流间发散。
 - **动作一致性损失**：将离散和连续动作预测投影到共享嵌入空间，最大化余弦相似度。
 
-### 6. 潜在世界模型
+### 6. 世界模型 (TODO)
 
-可选的 DreamerV3 风格想象引擎，预测未来潜在状态，使智能体在执行前评估动作后果：
+DreamerV3 风格的潜在世界模型已规划但**尚未启用**（`world_model.enable = false`）。代码框架存在于 `vla_hybrid_v2/world_model/` 中，包括：
 
-- **随机状态模块**：类别潜变量（48 类别 × 48 类），分离的先验/后验编码
-- **想象 Mamba**：8 层 Mamba（d_state=128）进行潜在动力学转移，步间显式状态持久化
-- **物体物理引擎**：基于 GNN 的物体交互建模（6 层），预测内在属性和交互权重
-- **噪声增强**：调度感知的噪声注入，防止想象 rollout 中的误差累积
-- **视觉解码器**：CNN 解码器用于辅助视觉监督
-- **子目标规划器**：为长时任务提议中间潜在目标
+- `ImaginationEngine` — 32 步潜在 rollout 编排器
+- `ImaginationMamba` — 8 层 Mamba 用于潜在动力学
+- `StochasticStateModule` — 类别潜变量（先验/后验）
+- `ObjectPhysicsEngine` — 基于 GNN 的物体交互建模
+- `CNNWorldDecoder`、`LatentSubgoalPlanner`、`WorldModelLoss`
 
-想象引擎执行 32 步 rollout，收集完整的损失数据用于端到端训练。
+这些组件已在架构上集成（主模型有 `get_world_model_state()` 接口），但尚未训练或验证。启用世界模型并将其集成到训练循环中是未来的工作。
 
 ## 训练策略
 
@@ -471,7 +475,13 @@ output = sigmoid(gate) * ((1 + scale) * RMSNorm(x) + shift)
 | **B** | 200K | 1e-4 | + Flow 专家 + EMA 启动 | `cond_prefix.detach()` —— 专家以冻结的条件表征训练，防止 flow matching 梯度破坏骨干稳定性。 |
 | **C** | 80K | 3e-5 | 全部组件 + RTC + FASTER | 端到端微调。更低学习率保护已学表征。 |
 
+**逐组件学习率缩放**（v0.10.5）：骨干 LoRA 使用 `learning_rate * 0.1`，动作专家使用 `learning_rate * 0.5`，防止预训练骨干漂移过快，同时允许随机初始化的专家快速收敛。
+
+**多步监督**（v0.10.3）：FAST 离散、阶段和 affordance 损失在训练窗口的所有 T 步计算（而非仅最后一步），提高感知模块的梯度密度。Flow matching 专家损失因计算成本仍仅在 `t=-1` 计算。
+
 **全局 batch size = 64**（每 GPU 2 × 8 GPU × 4 梯度累积）。**EMA** 衰减从 0.999 渐进到 0.9999，经过 20K 步，从 Stage B 开始。
+
+三个阶段由统一训练脚本（`scripts/train_unified.py`）管理，支持自动阶段检测、验证评估和断点续训。
 
 ## 推理管线
 
