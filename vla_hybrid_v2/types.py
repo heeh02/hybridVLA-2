@@ -96,6 +96,8 @@ class RuntimeCache:
     chunk_step: int = 0
     action_history: Optional[Tensor] = None  # [K, A]
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+    # v0.11: RTC — tail of previous chunk for overlap inpainting at inference
+    prev_chunk_tail: Optional[Tensor] = None  # [B, overlap, A]
 
 
 @dataclass

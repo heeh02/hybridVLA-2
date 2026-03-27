@@ -27,6 +27,7 @@ from PIL import Image
 from vla_hybrid_v2.config import HybridVLAv2Config
 from vla_hybrid_v2.data.base_adapter import BaseDatasetAdapter
 from vla_hybrid_v2.data.normalizer import Normalizer
+from vla_hybrid_v2.data.transforms import RobotImageAugmentation
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +62,33 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
         self.dcfg = cfg.data
         self.processor = processor
 
+        # v0.11: image augmentation (train split only)
+        self.augmentation = (
+            RobotImageAugmentation(cfg.data.augmentation)
+            if split == "train" else None
+        )
+
         self.window = cfg.train.sequence_window
         self.chunk_H = cfg.model.action_expert.chunk_horizon
         self.action_dim = cfg.model.action_expert.action_dim
         self.proprio_dim = cfg.model.proprio_dim
         self.refresh_stride = cfg.train.semantic_refresh_stride
         self.image_key = cfg.data.image_key  # e.g. "agentview_rgb"
+
+        # Multi-camera settings
+        self.multi_camera = cfg.model.multi_camera.enable
+        self.camera_keys: List[str] = (
+            cfg.data.camera_keys if self.multi_camera else [self.image_key]
+        )
+        self.camera_names: List[str] = cfg.model.multi_camera.camera_names
+        self.max_text_length = (
+            1024 if self.multi_camera else cfg.data.max_text_length
+        )
+        if self.multi_camera:
+            logger.info(
+                "Multi-camera enabled: %d cameras %s → HDF5 keys %s",
+                len(self.camera_keys), self.camera_names, self.camera_keys,
+            )
 
         # Discover episode files
         # V1 fix: val split uses separate dir or episode-ratio split
@@ -92,12 +114,27 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
             # Episode-ratio split when no separate val_data_dir
             if split == "val" and not self.dcfg.val_data_dir:
                 n_val = max(1, int(len(all_paths) * self.dcfg.val_ratio))
-                self.episode_paths = all_paths[-n_val:]  # last N episodes
+                # N3 fix: guard against tiny datasets where n_val >= total
+                if n_val >= len(all_paths):
+                    logger.warning(
+                        "val_ratio=%.2f yields n_val=%d >= total %d episodes. "
+                        "Val set will use all episodes (train/val overlap). "
+                        "Consider using val_data_dir for proper split.",
+                        self.dcfg.val_ratio, n_val, len(all_paths),
+                    )
+                self.episode_paths = all_paths[-n_val:]
             else:
                 if self.dcfg.val_data_dir is None and split == "train":
-                    # Exclude val episodes from train set
                     n_val = max(1, int(len(all_paths) * self.dcfg.val_ratio))
-                    self.episode_paths = all_paths[:-n_val] if n_val < len(all_paths) else all_paths
+                    if n_val >= len(all_paths):
+                        logger.warning(
+                            "val_ratio=%.2f yields n_val=%d >= total %d episodes. "
+                            "Train set will use all episodes (train/val overlap).",
+                            self.dcfg.val_ratio, n_val, len(all_paths),
+                        )
+                        self.episode_paths = all_paths
+                    else:
+                        self.episode_paths = all_paths[:-n_val]
                 else:
                     self.episode_paths = all_paths
 
@@ -154,16 +191,82 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
     # Image helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _read_image(data_grp, image_key: str, frame_idx: int) -> Optional[Image.Image]:
-        """Read a single RGB frame from HDF5 as PIL Image."""
+    def _read_image(self, data_grp, image_key: str, frame_idx: int) -> Optional[Image.Image]:
+        """Read a single RGB frame from HDF5 as PIL Image, with augmentation."""
         if "images" not in data_grp:
             return None
         images_grp = data_grp["images"]
         if image_key not in images_grp:
             return None
         raw = images_grp[image_key][frame_idx]  # [H, W, C] uint8
-        return Image.fromarray(raw)
+        img = Image.fromarray(raw)
+        if self.augmentation is not None:
+            img = self.augmentation(img)
+        return img
+
+    def _read_multi_camera_images(
+        self, data_grp, camera_keys: List[str], frame_idx: int,
+    ) -> List[Optional[Image.Image]]:
+        """Read one RGB frame per camera from HDF5."""
+        images: List[Optional[Image.Image]] = []
+        for key in camera_keys:
+            images.append(self._read_image(data_grp, key, frame_idx))
+        return images
+
+    # ------------------------------------------------------------------
+    # Multi-camera tokenization
+    # ------------------------------------------------------------------
+
+    def _process_text_multi_image(
+        self, lang: str, pil_images: List[Optional[Image.Image]],
+    ) -> dict:
+        """Tokenize text + multiple camera images via Qwen2-VL processor.
+
+        Uses apply_chat_template for proper multi-image formatting.
+        Falls back to single-image path when only one valid image exists.
+        """
+        if self.processor is None:
+            return self._process_text_image(lang, None)
+
+        _TARGET = (448, 448)
+        valid_images: List[Image.Image] = []
+        for img in pil_images:
+            if img is not None:
+                if img.size != _TARGET:
+                    img = img.resize(_TARGET, Image.BILINEAR)
+                img = img.convert("RGB")
+                valid_images.append(img)
+
+        if len(valid_images) == 0:
+            return self._process_text_image(lang, None)
+        if len(valid_images) == 1:
+            return self._process_text_image(lang, valid_images[0])
+
+        # Build multi-image conversation for Qwen2-VL processor
+        content: list = []
+        for _ in valid_images:
+            content.append({"type": "image"})
+        content.append({"type": "text", "text": lang})
+        messages = [{"role": "user", "content": content}]
+
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False,
+        )
+
+        tok = self.processor(
+            text=[text], images=valid_images,
+            return_tensors="pt", padding="max_length",
+            truncation=True, max_length=self.max_text_length,
+        )
+        return {
+            "input_ids": tok["input_ids"].squeeze(0),
+            "attention_mask": tok["attention_mask"].squeeze(0),
+            "pixel_values": tok["pixel_values"].squeeze(0)
+                if "pixel_values" in tok else None,
+            "image_grid_thw": tok["image_grid_thw"].squeeze(0)
+                if "image_grid_thw" in tok else None,
+            "num_cameras": len(valid_images),
+        }
 
     def _process_text_image(
         self, lang: str, pil_image: Optional[Image.Image],
@@ -244,18 +347,32 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
                 if isinstance(lang, bytes):
                     lang = lang.decode("utf-8")
 
-            # ---- v0.10.3 P0-B: Read observation image ----
-            # Use frame at START of window as the primary observation
-            primary_image = self._read_image(data, self.image_key, start)
+            # ---- Read observation image(s) ----
+            if self.multi_camera:
+                primary_images = self._read_multi_camera_images(
+                    data, self.camera_keys, start,
+                )
+            else:
+                primary_images = None
+                primary_image = self._read_image(data, self.image_key, start)
 
-            # ---- v0.10.3 P0-B: Build refresh frames ----
+            # ---- Build refresh frames ----
             refresh_steps = list(range(0, T, self.refresh_stride))
             R = len(refresh_steps)
-            refresh_images: List[Optional[Image.Image]] = []
-            for r_step in refresh_steps:
-                refresh_images.append(
-                    self._read_image(data, self.image_key, start + r_step)
-                )
+            if self.multi_camera:
+                refresh_multi_images: List[List[Optional[Image.Image]]] = []
+                for r_step in refresh_steps:
+                    refresh_multi_images.append(
+                        self._read_multi_camera_images(
+                            data, self.camera_keys, start + r_step,
+                        )
+                    )
+            else:
+                refresh_images: List[Optional[Image.Image]] = []
+                for r_step in refresh_steps:
+                    refresh_images.append(
+                        self._read_image(data, self.image_key, start + r_step)
+                    )
 
         # Normalize
         raw_actions_t = torch.from_numpy(raw_actions.astype(np.float32))
@@ -275,8 +392,11 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
         if T > 1:
             prev_actions[1:] = norm_actions[:-1]
 
-        # ---- Primary observation tokenization (text + first-frame image) ----
-        primary_tok = self._process_text_image(lang, primary_image)
+        # ---- Primary observation tokenization ----
+        if self.multi_camera:
+            primary_tok = self._process_text_multi_image(lang, primary_images)
+        else:
+            primary_tok = self._process_text_image(lang, primary_image)
 
         sample = {
             "input_ids": primary_tok["input_ids"],
@@ -290,29 +410,57 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
         }
 
         # Add primary vision fields if available
-        if primary_tok["pixel_values"] is not None:
+        if primary_tok.get("pixel_values") is not None:
             sample["pixel_values"] = primary_tok["pixel_values"]
             sample["image_grid_thw"] = primary_tok["image_grid_thw"]
 
-        # ---- v0.10.3 P0-B: Refresh frame tokenization ----
-        # Only produce refresh fields when we have images AND R > 1
-        has_any_image = any(img is not None for img in refresh_images)
-        if self.processor is not None and R > 1 and has_any_image:
-            refresh_input_ids_list = []
-            refresh_attention_mask_list = []
-            refresh_pv_list: List[Optional[torch.Tensor]] = []
-            refresh_thw_list: List[Optional[torch.Tensor]] = []
+        # Track number of cameras for downstream camera position embeddings
+        if self.multi_camera:
+            sample["num_cameras"] = primary_tok.get("num_cameras", len(self.camera_keys))
+        else:
+            sample["num_cameras"] = 1
 
-            for img in refresh_images:
-                tok = self._process_text_image(lang, img)
-                refresh_input_ids_list.append(tok["input_ids"])
-                refresh_attention_mask_list.append(tok["attention_mask"])
-                refresh_pv_list.append(tok["pixel_values"])
-                refresh_thw_list.append(tok["image_grid_thw"])
+        # ---- Refresh frame tokenization ----
+        if self.multi_camera:
+            has_any_image = any(
+                any(img is not None for img in imgs)
+                for imgs in refresh_multi_images
+            )
+            if self.processor is not None and R > 1 and has_any_image:
+                refresh_input_ids_list = []
+                refresh_attention_mask_list = []
+                refresh_pv_list: List[Optional[torch.Tensor]] = []
+                refresh_thw_list: List[Optional[torch.Tensor]] = []
 
-            sample["refresh_input_ids"] = torch.stack(refresh_input_ids_list)       # [R, L]
-            sample["refresh_attention_mask"] = torch.stack(refresh_attention_mask_list)  # [R, L]
-            sample["refresh_pixel_values_list"] = refresh_pv_list    # List[Tensor], len=R
-            sample["refresh_image_grid_thw_list"] = refresh_thw_list  # List[Tensor], len=R
+                for imgs in refresh_multi_images:
+                    tok = self._process_text_multi_image(lang, imgs)
+                    refresh_input_ids_list.append(tok["input_ids"])
+                    refresh_attention_mask_list.append(tok["attention_mask"])
+                    refresh_pv_list.append(tok.get("pixel_values"))
+                    refresh_thw_list.append(tok.get("image_grid_thw"))
+
+                sample["refresh_input_ids"] = torch.stack(refresh_input_ids_list)
+                sample["refresh_attention_mask"] = torch.stack(refresh_attention_mask_list)
+                sample["refresh_pixel_values_list"] = refresh_pv_list
+                sample["refresh_image_grid_thw_list"] = refresh_thw_list
+        else:
+            has_any_image = any(img is not None for img in refresh_images)
+            if self.processor is not None and R > 1 and has_any_image:
+                refresh_input_ids_list = []
+                refresh_attention_mask_list = []
+                refresh_pv_list_sc: List[Optional[torch.Tensor]] = []
+                refresh_thw_list_sc: List[Optional[torch.Tensor]] = []
+
+                for img in refresh_images:
+                    tok = self._process_text_image(lang, img)
+                    refresh_input_ids_list.append(tok["input_ids"])
+                    refresh_attention_mask_list.append(tok["attention_mask"])
+                    refresh_pv_list_sc.append(tok["pixel_values"])
+                    refresh_thw_list_sc.append(tok["image_grid_thw"])
+
+                sample["refresh_input_ids"] = torch.stack(refresh_input_ids_list)
+                sample["refresh_attention_mask"] = torch.stack(refresh_attention_mask_list)
+                sample["refresh_pixel_values_list"] = refresh_pv_list_sc
+                sample["refresh_image_grid_thw_list"] = refresh_thw_list_sc
 
         return sample

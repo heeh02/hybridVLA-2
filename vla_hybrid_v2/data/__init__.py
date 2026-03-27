@@ -70,6 +70,34 @@ def build_dataset(cfg, split="train", processor=None):
         )
         return dataset, vla_collate_fn
 
+    if fmt == "libero_hdf5":
+        from vla_hybrid_v2.data.libero_hdf5_adapter import LiberoHDF5DatasetAdapter
+
+        action_norm = ActionNormalizer(target_range=cfg.model.heads.action_range)
+        proprio_norm = ProprioNormalizer(target_range=cfg.model.proprio_range)
+
+        from pathlib import Path
+        if cfg.data.normalizer_stats_dir:
+            stats_dir = Path(cfg.data.normalizer_stats_dir)
+        else:
+            stats_dir = Path(cfg.train.output_dir) / "normalizer_stats"
+        action_stats = stats_dir / "action_stats.json"
+        proprio_stats = stats_dir / "proprio_stats.json"
+
+        if action_stats.exists() and proprio_stats.exists():
+            action_norm.load(action_stats)
+            proprio_norm.load(proprio_stats)
+        else:
+            raise FileNotFoundError(
+                f"Normalizer stats not found at {stats_dir}. "
+                f"Run LIBERO data preparation first."
+            )
+
+        dataset = LiberoHDF5DatasetAdapter(
+            cfg, action_norm, proprio_norm, processor=processor, split=split,
+        )
+        return dataset, vla_collate_fn
+
     elif fmt is None or fmt == "dummy":
         size = cfg.train.max_steps * cfg.train.per_device_batch_size * 2
         dataset = DummyVLADataset(size=size, cfg=cfg)
@@ -78,5 +106,5 @@ def build_dataset(cfg, split="train", processor=None):
     else:
         raise ValueError(
             f"Unknown data format: '{fmt}'. "
-            f"Supported: 'hdf5', 'dummy', or None (defaults to dummy)."
+            f"Supported: 'hdf5', 'libero_hdf5', 'dummy', or None (defaults to dummy)."
         )

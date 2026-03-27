@@ -53,6 +53,76 @@ class MultiScaleAdapter(nn.Module):
         return (stacked * weights[:, None, None, :]).sum(dim=-1)  # [B, N, output_dim]
 
 
+class CameraPositionEmbedding(nn.Module):
+    """Learnable per-camera embedding added to backbone vision features.
+
+    When multiple cameras are processed in a single forward pass, each
+    camera's vision tokens are consecutive in the sequence.  This module
+    identifies them via ``image_grid_thw`` and adds a camera-specific
+    learned embedding so downstream modules (grounder) can distinguish
+    camera sources.
+    """
+
+    def __init__(self, max_cameras: int = 8, hidden_size: int = 2048) -> None:
+        super().__init__()
+        self.camera_embeddings = nn.Embedding(max_cameras, hidden_size)
+        nn.init.normal_(self.camera_embeddings.weight, std=0.02)
+
+    def forward(
+        self,
+        features: Tensor,
+        vision_mask: Tensor,
+        image_grid_thw: Optional[Tensor],
+        num_cameras: int = 1,
+    ) -> Tensor:
+        """Add camera embeddings to vision tokens.
+
+        Args:
+            features: [B, N, D] backbone features (text + vision tokens).
+            vision_mask: [B, N] bool mask — True for vision tokens.
+            image_grid_thw: [num_images, 3] grid dimensions per image.
+            num_cameras: number of cameras (images are ordered by camera).
+
+        Returns:
+            features with camera embeddings added to vision positions.
+        """
+        if num_cameras <= 1 or image_grid_thw is None:
+            return features
+
+        # Compute tokens per image from grid_thw: t * ceil(h/2) * ceil(w/2)
+        # Qwen2-VL merges 2×2 spatial patches, so effective tokens = prod / 4
+        merge_factor = 4  # 2×2 spatial merge
+        tokens_per_image = []
+        for i in range(image_grid_thw.shape[0]):
+            t, h, w = image_grid_thw[i].tolist()
+            tokens_per_image.append(int(t * h * w // merge_factor))
+
+        # Map each image index → camera index (round-robin if images > cameras,
+        # e.g. 3 cameras means images 0,1,2 → cameras 0,1,2)
+        cam_indices: list = []
+        for img_idx, n_tok in enumerate(tokens_per_image):
+            cam_idx = img_idx % num_cameras
+            cam_indices.extend([cam_idx] * n_tok)
+
+        if not cam_indices:
+            return features
+
+        cam_ids = torch.tensor(cam_indices, device=features.device, dtype=torch.long)
+        cam_emb = self.camera_embeddings(cam_ids)  # [total_vision_tokens, D]
+
+        # Apply to each batch element at vision positions
+        B = features.shape[0]
+        out = features.clone()
+        for b in range(B):
+            vis_idx = vision_mask[b].nonzero(as_tuple=True)[0]
+            n_vis = vis_idx.shape[0]
+            n_emb = cam_emb.shape[0]
+            n = min(n_vis, n_emb)
+            if n > 0:
+                out[b, vis_idx[:n]] = out[b, vis_idx[:n]] + cam_emb[:n]
+        return out
+
+
 class Qwen2VLBackboneWrapper(nn.Module):
     """Wraps Qwen2-VL-7B as feature extractor with multi-scale + multi-camera.
 
@@ -105,6 +175,11 @@ class Qwen2VLBackboneWrapper(nn.Module):
         # Multi-scale adapter
         self.multi_scale_adapter = MultiScaleAdapter(
             self.hidden_size, output_dim, len(self.multi_scale_layers),
+        )
+
+        # Camera position embeddings (used when multi_camera.enable=True)
+        self.camera_position_embedding = CameraPositionEmbedding(
+            max_cameras=8, hidden_size=output_dim,
         )
 
     def _apply_freeze(self, freeze_vision, freeze_until):
@@ -179,7 +254,8 @@ class Qwen2VLBackboneWrapper(nn.Module):
         )
 
     def forward_semantic(self, input_ids, attention_mask,
-                         pixel_values=None, image_grid_thw=None) -> Dict[str, Tensor]:
+                         pixel_values=None, image_grid_thw=None,
+                         num_cameras: int = 1) -> Dict[str, Tensor]:
         model_kwargs = dict(
             input_ids=input_ids, attention_mask=attention_mask,
             output_hidden_states=True, return_dict=True, use_cache=False,
@@ -204,6 +280,12 @@ class Qwen2VLBackboneWrapper(nn.Module):
 
         vision_mask = (input_ids == self.IMAGE_TOKEN_ID) | (input_ids == self.VIDEO_TOKEN_ID)
         text_mask = attention_mask.bool() & ~vision_mask
+
+        # Add camera position embeddings when multi-camera
+        if num_cameras > 1:
+            fused = self.camera_position_embedding(
+                fused, vision_mask, image_grid_thw, num_cameras,
+            )
 
         return {
             "last_hidden_state": fused,  # [B, N, 2048] (projected)

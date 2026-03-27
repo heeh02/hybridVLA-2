@@ -1,0 +1,43 @@
+# Stage B (Compressed): Action expert + knowledge insulation — 80K steps (was 200K)
+# Flow expert converges within 50-80K steps with detached conditioning.
+
+defaults:
+  - ../model/v2_qwen2vl_7b_trirate_expert18
+
+stage: b
+
+train:
+  max_steps: 80000
+  warmup_steps: 3000
+  learning_rate: 1.5e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  sequence_window: 24
+  semantic_refresh_stride: 6
+  medium_update_stride: 2
+  global_batch_size: 64
+  per_device_batch_size: 2
+  grad_accum_steps: 4
+
+  bf16: true
+  fsdp: true
+  checkpointing: true
+
+  stop_gradient_cond_prefix: true
+  block_fm_to_backbone: true
+  ema_decay: 0.999
+
+  expert_lr_scale: 0.7
+
+  loss_weights:
+    fast_discrete: 1.0
+    phase: 0.5
+    affordance: 0.3
+    consistency: 0.3
+    flow_matching: 1.0
+
+  resume_from: outputs/v2_stage_a/checkpoint-latest
+  eval_interval: 2000
+  save_interval: 5000
+  output_dir: outputs/v2_stage_b

@@ -105,7 +105,25 @@ def load_checkpoint(
         ckpt_dir = ckpt_dir.resolve()
 
     state = torch.load(ckpt_dir / "model.pt", map_location=map_location, weights_only=True)
-    missing, unexpected = model.load_state_dict(state, strict=strict)
+
+    # N1 fix: FSDP models need state_dict_type context to correctly load
+    # a FULL_STATE_DICT checkpoint.  Without this, FSDP's default LOCAL
+    # state_dict type causes key mismatch and silent param loss.
+    try:
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            FullStateDictConfig,
+            StateDictType,
+        )
+        if isinstance(model, FSDP):
+            fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_cfg):
+                missing, unexpected = model.load_state_dict(state, strict=strict)
+        else:
+            missing, unexpected = model.load_state_dict(state, strict=strict)
+    except ImportError:
+        missing, unexpected = model.load_state_dict(state, strict=strict)
+
     if missing:
         logger.warning("Missing %d keys: %s...", len(missing), missing[:3])
     if unexpected:

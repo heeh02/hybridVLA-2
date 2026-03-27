@@ -1,0 +1,29 @@
+[project]
+name = "hybridvla-v2"
+version = "0.11.0"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "manual: requires GPU or large files (not run in CI)",
+    "slow: runs > 30 seconds",
+]
+addopts = "--strict-markers -m 'not manual' -v"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"

@@ -75,9 +75,27 @@ def vla_collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
             transposed = []
             for r in range(R):
                 frame_vals = [v[r] for v in values]
-                if frame_vals[0] is None:
+                # N2 fix: check ALL samples, not just [0], for None/Tensor mixing.
+                # If any sample is None while others are Tensor, skip the None
+                # samples and pad with zeros to keep batch dimension consistent.
+                non_none = [v for v in frame_vals if v is not None]
+                all_none = len(non_none) == 0
+                if all_none:
                     transposed.append(None)
-                elif isinstance(frame_vals[0], Tensor):
+                elif isinstance(non_none[0], Tensor):
+                    # Replace None entries with zero tensors matching shape
+                    if len(non_none) < len(frame_vals):
+                        template = non_none[0]
+                        frame_vals = [
+                            v if v is not None
+                            else torch.zeros_like(template)
+                            for v in frame_vals
+                        ]
+                        logger.warning(
+                            "collate: mixed None/Tensor in '%s[%d]' — "
+                            "padded %d None entries with zeros.",
+                            key, r, len(frame_vals) - len(non_none),
+                        )
                     if is_vision:
                         transposed.append(
                             _safe_stack_vision(frame_vals, f"{key}[{r}]"))

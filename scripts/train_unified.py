@@ -101,9 +101,12 @@ def configure_trainable_modules(
         if "lora" in name.lower():
             p.requires_grad = True
 
-    # Step 3: re-enable backbone multi-scale adapter
+    # Step 3: re-enable backbone multi-scale adapter and camera embeddings
     if hasattr(model.backbone, "multi_scale_adapter"):
         for p in model.backbone.multi_scale_adapter.parameters():
+            p.requires_grad = True
+    if hasattr(model.backbone, "camera_position_embedding"):
+        for p in model.backbone.camera_position_embedding.parameters():
             p.requires_grad = True
 
     # Step 4: modules trainable in ALL stages (A/B/C)
@@ -495,7 +498,10 @@ def train(cfg: HybridVLAv2Config) -> None:
                     elapsed = time.monotonic() - step_start
                     sps = cfg.train.log_interval / max(elapsed, 1e-6)
                     lr = scheduler.get_last_lr()[0]
-                    avg = {k: v / cfg.train.log_interval for k, v in accum_loss.items()}
+                    # N4 fix: divide by log_interval * grad_accum because we
+                    # accumulate one raw loss per micro-batch (not per optimizer step).
+                    avg = {k: v / (cfg.train.log_interval * grad_accum)
+                           for k, v in accum_loss.items()}
                     parts = " | ".join(f"{k}: {v:.4f}" for k, v in avg.items())
                     logger.info("Step %d | %s | gnorm: %.3f | lr: %.2e | %.1f sps",
                                 global_step, parts, grad_norm.item(), lr, sps)

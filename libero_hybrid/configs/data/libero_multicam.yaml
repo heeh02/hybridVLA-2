@@ -1,0 +1,32 @@
+# LIBERO multi-camera data config (agentview + eye_in_hand)
+# Official obs spec: low_dim = [joint_states(7), gripper_states(2)] = 9-dim
+# Actions: 7-dim (6 joint vel + 1 gripper)
+
+data:
+  format: libero_hdf5
+  image_key: agentview_rgb
+  camera_keys:
+    - agentview_rgb
+    - eye_in_hand_rgb
+  proprio_key: joint_states
+  proprio_keys: [joint_states, gripper_states]
+  action_key: actions
+  language_key: language_instruction
+  max_text_length: 1024
+  val_ratio: 0.1
+
+model:
+  # LIBERO Franka Panda dimensions
+  action_expert:
+    action_dim: 7
+    chunk_horizon: 16
+  proprio_dim: 9                      # joint_states(7) + gripper_states(2)
+  heads:
+    action_range: [-1.0, 1.0]
+  multi_camera:
+    enable: true
+    num_cameras: 2
+    camera_names:
+      - agentview
+      - eye_in_hand
+    fusion: concat

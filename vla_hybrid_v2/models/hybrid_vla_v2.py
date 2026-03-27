@@ -11,7 +11,7 @@ Composes all v2 sub-modules into the tri-rate VLA pipeline:
 Stage-gated training (same semantics as v1):
 - Stage A: backbone LoRA + grounder + tri-rate core + heads. Expert frozen.
 - Stage B: adds expert with cond_prefix.detach(). EMA starts.
-- Stage C: full fine-tune with RTC/FASTER.
+- Stage C: full fine-tune with RTC (overlap inpainting) + FASTER (per-step weighting).
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from vla_hybrid_v2.config import HybridVLAv2Config
@@ -368,6 +369,12 @@ class HybridVLAv2(nn.Module):
         medium_stride = self.cfg.train.medium_update_stride
         medium_set = set(range(0, T, medium_stride))
 
+        # ---- Multi-camera: resolve num_cameras ----
+        num_cameras = 1
+        if "num_cameras" in batch and batch["num_cameras"] is not None:
+            nc = batch["num_cameras"]
+            num_cameras = int(nc[0].item()) if hasattr(nc, '__getitem__') else int(nc)
+
         # ---- Backbone + Grounder per refresh point ----
         grounder_outputs: List[GrounderOutput] = []
         if "refresh_input_ids" in batch:
@@ -377,8 +384,8 @@ class HybridVLAv2(nn.Module):
                     attention_mask=batch["refresh_attention_mask"][:, r],
                     pixel_values=batch.get("refresh_pixel_values_list", [None] * R)[r],
                     image_grid_thw=batch.get("refresh_image_grid_thw_list", [None] * R)[r],
+                    num_cameras=num_cameras,
                 )
-                # v0.9.1: pass attention_mask to grounder (Issue 3)
                 grounder_mask = batch["refresh_attention_mask"][:, r].bool()
                 grounder_outputs.append(self.grounder(
                     backbone_out["last_hidden_state"], attention_mask=grounder_mask,
@@ -389,11 +396,10 @@ class HybridVLAv2(nn.Module):
                 attention_mask=batch["attention_mask"],
                 pixel_values=batch.get("pixel_values"),
                 image_grid_thw=batch.get("image_grid_thw"),
+                num_cameras=num_cameras,
             )
             backbone_hidden = backbone_out["last_hidden_state"]
-            # v0.9.1: pass attention_mask to grounder (Issue 3)
             grounder_mask = batch["attention_mask"].bool()
-            # v0.5 fix: run grounder once and reuse (was redundantly called R times)
             single_grounder_out = self.grounder(backbone_hidden, attention_mask=grounder_mask)
             for _ in range(R):
                 grounder_outputs.append(single_grounder_out)
@@ -547,23 +553,96 @@ class HybridVLAv2(nn.Module):
                 embodiment_token=emb_for_expert,
             )
 
+            # Recover denoised x_1 from flow matching (used by RTC, FASTER aux, consistency)
+            # x_t = (1-t)*x_0 + t*x_1, v = x_1 - x_0  =>  x_1 = x_t + (1-t)*v
+            expert_denoised = noisy_actions + (1.0 - flow_t[:, None, None]) * expert_out.velocity
+
             step_weights = batch.get("step_weights", None)
-            loss_fm = self.flow_matching_loss(
-                expert_out.velocity, noise, target_actions, flow_t,
-                step_weights=step_weights,
-            )
+
+            # ---- FASTER: per-step weighted FM loss (Stage C) ----
+            if stage == "c" and self.cfg.train.faster.enable:
+                faster_cfg = self.cfg.train.faster
+                H = self.cfg.model.action_expert.chunk_horizon
+                near_boundary = max(1, int(faster_cfg.near_ratio * H))
+
+                # Near steps get higher weight to prioritise imminent actions
+                faster_w = torch.ones(H, device=device)
+                far_ratio = max(faster_cfg.far_steps, 1) / max(faster_cfg.near_steps, 1)
+                faster_w[:near_boundary] *= far_ratio
+                faster_w = faster_w * (H / faster_w.sum())  # normalise so total = H
+
+                target_velocity = target_actions - noise
+                per_step_mse = (expert_out.velocity - target_velocity).pow(2).mean(dim=-1)  # [B, H]
+                if step_weights is not None:
+                    per_step_mse = per_step_mse * step_weights
+                loss_fm = (per_step_mse * faster_w.unsqueeze(0)).mean()
+            else:
+                loss_fm = self.flow_matching_loss(
+                    expert_out.velocity, noise, target_actions, flow_t,
+                    step_weights=step_weights,
+                )
             losses["loss_fm"] = loss_fm * weights.get("flow_matching", 1.0)
 
+            # ---- RTC: overlapping chunk inpainting loss (Stage C) ----
+            if stage == "c" and self.cfg.train.rtc.enable:
+                rtc_cfg = self.cfg.train.rtc
+                exec_H = rtc_cfg.execution_horizon
+                overlap = max(1, int(rtc_cfg.overlap_ratio * exec_H))
+                H = self.cfg.model.action_expert.chunk_horizon
+
+                if overlap < H and overlap < exec_H:
+                    # Generate a "previous chunk" with fast low-precision sampling
+                    with torch.no_grad():
+                        prev_chunk = self.action_expert.sample(
+                            cond_prefix=cond_prefix,
+                            proprio_token=proprio_for_expert,
+                            embodiment_token=emb_for_expert,
+                            num_steps=rtc_cfg.prev_chunk_steps,
+                            solver="euler",
+                        )  # [B, H, A]
+
+                    # Inpainting: current chunk head should match previous chunk tail
+                    prev_tail = prev_chunk[:, exec_H - overlap: exec_H].detach()
+                    curr_head = expert_denoised[:, :overlap]
+                    loss_rtc = F.mse_loss(curr_head, prev_tail)
+
+                    # Boundary smoothness: penalise acceleration discontinuity
+                    # across the prev→curr seam.  Need ≥3 points for a
+                    # second-order finite difference, so use full prev_tail
+                    # + curr_head (2*overlap points when overlap ≥ 2).
+                    if rtc_cfg.smooth_weight > 0 and overlap >= 2:
+                        boundary = torch.cat(
+                            [prev_tail.detach(), curr_head], dim=1,
+                        )  # [B, 2*overlap, A]
+                        accel = boundary[:, 2:] - 2 * boundary[:, 1:-1] + boundary[:, :-2]
+                        if accel.numel() > 0:
+                            loss_rtc = loss_rtc + rtc_cfg.smooth_weight * accel.pow(2).mean()
+
+                    losses["loss_rtc"] = loss_rtc * weights.get("rtc", 0.3)
+
+            # ---- FASTER: near-horizon auxiliary loss (Stage C) ----
+            # Penalise the denoised prediction's near-horizon error more
+            # heavily.  Previous version used torch.no_grad() multi-step
+            # sampling, which produced zero gradient — replaced with the
+            # differentiable single-step denoised prediction (expert_denoised).
+            if stage == "c" and self.cfg.train.faster.enable:
+                faster_cfg = self.cfg.train.faster
+                H = self.cfg.model.action_expert.chunk_horizon
+                near_boundary = max(1, int(faster_cfg.near_ratio * H))
+                if faster_cfg.aux_loss_weight > 0:
+                    loss_faster_aux = F.mse_loss(
+                        expert_denoised[:, :near_boundary],
+                        target_actions[:, :near_boundary],
+                    )
+                    losses["loss_faster"] = loss_faster_aux * weights.get("faster", 0.2)
+
             # v2 consistency: contrastive + slow-fast + action agreement
-            # v0.9.1 fix: Rectified Flow denoising — recover x_1 from x_t.
-            # x_t = (1-t)*x_0 + t*x_1, v = x_1 - x_0  ⟹  x_1 = x_t + (1-t)*v
-            expert_continuous = noisy_actions + (1.0 - flow_t[:, None, None]) * expert_out.velocity
             losses["loss_consistency"] = self.consistency_loss(
                 fused_states,
                 fast_tokens=fast_tokens,
                 slow_token=temporal_outputs[-1].slow_token,
                 discrete_actions=fast_continuous,
-                continuous_actions=expert_continuous.detach(),
+                continuous_actions=expert_denoised.detach(),
             ) * weights.get("consistency", 0.3)
         else:
             losses["loss_consistency"] = self.consistency_loss(
@@ -580,13 +659,14 @@ class HybridVLAv2(nn.Module):
     # ------------------------------------------------------------------
 
     def semantic_step(self, input_ids, attention_mask,
-                      pixel_values=None, image_grid_thw=None) -> GrounderOutput:
+                      pixel_values=None, image_grid_thw=None,
+                      num_cameras: int = 1) -> GrounderOutput:
         with torch.no_grad():
             backbone_out = self.backbone.forward_semantic(
                 input_ids=input_ids, attention_mask=attention_mask,
                 pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+                num_cameras=num_cameras,
             )
-            # v0.9.1: pass attention_mask to grounder (Issue 3)
             return self.grounder(
                 backbone_out["last_hidden_state"],
                 attention_mask=attention_mask.bool() if attention_mask is not None else None,
@@ -680,6 +760,25 @@ class HybridVLAv2(nn.Module):
                     num_steps=num_sample_steps,
                     solver=solver,
                 )
+                # v0.11: RTC — blend overlap region with previous chunk tail
+                rtc_cfg = self.cfg.infer.rtc
+                if rtc_cfg.enable and runtime_state.prev_chunk_tail is not None:
+                    overlap = runtime_state.prev_chunk_tail.shape[1]
+                    if overlap > 0 and overlap <= denoised.shape[1]:
+                        alpha = torch.linspace(1, 0, overlap, device=device)
+                        alpha = alpha[None, :, None]  # [1, overlap, 1]
+                        denoised[:, :overlap] = (
+                            alpha * runtime_state.prev_chunk_tail
+                            + (1 - alpha) * denoised[:, :overlap]
+                        )
+
+                # Save current chunk tail for next RTC blending
+                if rtc_cfg.enable:
+                    rtc_overlap = max(1, int(rtc_cfg.overlap_ratio * exec_horizon))
+                    runtime_state.prev_chunk_tail = denoised[
+                        :, exec_horizon - rtc_overlap: exec_horizon
+                    ].clone()
+
                 runtime_state.current_chunk = denoised  # [B, H, A]
                 runtime_state.chunk_step = 0
 

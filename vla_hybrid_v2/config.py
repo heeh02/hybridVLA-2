@@ -51,11 +51,13 @@ class BackboneConfig:
 
 @dataclass
 class MultiCameraConfig:
-    enable: bool = False  # NOT YET IMPLEMENTED — set True when multi-camera adapter is ready
+    enable: bool = False
     num_cameras: int = 3
     camera_names: List[str] = field(default_factory=lambda: [
-        "wrist", "shoulder", "overhead",
+        "agentview", "eye_in_hand", "left_view",
     ])
+    fusion: str = "concat"  # currently only "concat" (implicit via Qwen2-VL multi-image token sequence)
+    max_cameras: int = 8  # max for camera position embedding table
 
 
 @dataclass
@@ -194,14 +196,17 @@ class RTCTrainConfig:
     execution_horizon: int = 8
     overlap_ratio: float = 0.333
     inpaint_overlap: bool = True
+    smooth_weight: float = 0.1       # boundary smoothness regularisation weight
+    prev_chunk_steps: int = 4        # ODE steps for generating the "previous" chunk (fast, low-precision)
 
 
 @dataclass
 class FASTERTrainConfig:
     enable: bool = False
-    near_ratio: float = 0.3
-    near_steps: int = 2
-    far_steps: int = 8
+    near_ratio: float = 0.3          # first 30% of chunk steps are "near"
+    near_steps: int = 2              # coarse sampling steps for near-horizon auxiliary loss
+    far_steps: int = 8               # used only for weight ratio computation
+    aux_loss_weight: float = 0.2     # weight of the coarse near-horizon auxiliary loss
 
 
 @dataclass
@@ -288,6 +293,19 @@ class InferConfig:
 
 
 @dataclass
+class AugmentationConfig:
+    """Image augmentation for training (reference: OpenPI transforms.py)."""
+    enable: bool = True
+    random_crop_scale: float = 0.95    # RandomResizedCrop minimum scale
+    random_rotation: float = 5.0       # degrees
+    color_jitter: bool = True
+    brightness: float = 0.1
+    contrast: float = 0.1
+    saturation: float = 0.1
+    hue: float = 0.02
+
+
+@dataclass
 class DataConfig:
     format: Optional[str] = None
     paths: List[str] = field(default_factory=list)
@@ -296,6 +314,8 @@ class DataConfig:
     split: str = "train"
     image_key: str = "agentview_rgb"
     proprio_key: str = "robot0_joint_pos"
+    # LIBERO: concatenate multiple proprio keys [joint_states(7) + gripper_states(2)]
+    proprio_keys: List[str] = field(default_factory=list)  # if non-empty, concat these instead of proprio_key
     action_key: str = "actions"
     language_key: str = "language_instruction"
     language: str = "complete the task"
@@ -304,10 +324,14 @@ class DataConfig:
     normalizer_stats_dir: Optional[str] = None  # v0.10.1: explicit path; falls back to {output_dir}/normalizer_stats
     val_data_dir: Optional[str] = None  # v0.10.5: separate val data directory; if None, split by episode ratio
     val_ratio: float = 0.1  # fraction of episodes for val when val_data_dir is None
-    # v2: multi-camera
+    # v2: multi-camera — HDF5 image group keys per camera
     camera_keys: List[str] = field(default_factory=lambda: [
-        "agentview_rgb", "wrist_rgb", "overhead_rgb",
+        "agentview_rgb",
+        "robot0_eye_in_hand_rgb",
+        "robot0_agentview_left_rgb",
     ])
+    max_text_length: int = 256  # auto-increased to 1024 when multi_camera.enable
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
 
 
 # ---------------------------------------------------------------------------

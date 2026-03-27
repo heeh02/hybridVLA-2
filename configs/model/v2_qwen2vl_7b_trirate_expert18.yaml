@@ -26,7 +26,9 @@ model:
   multi_camera:
     enable: false
     num_cameras: 3
-    camera_names: [wrist, shoulder, overhead]
+    camera_names: [agentview, eye_in_hand, left_view]
+    fusion: concat
+    max_cameras: 8
 
   grounder:
     hidden_size: 2048

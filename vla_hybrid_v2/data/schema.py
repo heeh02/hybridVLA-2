@@ -40,6 +40,9 @@ class WindowSample:
     refresh_pixel_values_list: Optional[List[Tensor]] = None   # List[Tensor] len=R
     refresh_image_grid_thw_list: Optional[List[Tensor]] = None  # List[Tensor] len=R
 
+    # --- Multi-camera metadata ---
+    num_cameras: int = 1  # number of cameras used for this sample
+
     # --- Optional labels ---
     phase_labels: Optional[Tensor] = None        # [T]
     affordance_labels: Optional[Tensor] = None   # [T]
@@ -65,6 +68,7 @@ BATCH_VISION_KEYS = frozenset({
 BATCH_OPTIONAL_KEYS = frozenset({
     "semantic_refresh_steps",   # List[int]
     "embodiment_id",            # [B]
+    "num_cameras",              # [B] or scalar
     "phase_labels",             # [B, T]
     "affordance_labels",        # [B, T]
     "step_weights",             # [B, H]

@@ -228,12 +228,85 @@ def train(steps: int = 20, stage: str = "a"):
     log.info("Smoke test PASSED — no NaN, no crash.")
 
 
+def train_multi_camera(steps: int = 10):
+    """Smoke test for multi-camera mode with 3 dummy cameras."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Multi-camera smoke test — device: {device}, steps: {steps}")
+
+    cfg = _mini_cfg(stage="a")
+    cfg.model.multi_camera.enable = True
+    cfg.model.multi_camera.num_cameras = 3
+
+    with patch(
+        "vla_hybrid_v2.models.hybrid_vla_v2.Qwen2VLBackboneWrapper.from_config",
+        return_value=_MockBackbone(D_CORE),
+    ):
+        from vla_hybrid_v2.models.hybrid_vla_v2 import HybridVLAv2
+        model = HybridVLAv2(cfg)
+
+    from scripts.train_unified import (
+        configure_trainable_modules,
+        sanity_check_trainable_params,
+    )
+    configure_trainable_modules(model, "a", cfg)
+    sanity_check_trainable_params(model, "a")
+    model = model.to(device)
+
+    # Dataset with num_cameras field
+    class MultiCamDummyDataset(Dataset):
+        def __init__(self, size=100):
+            self.size = size
+        def __len__(self):
+            return self.size
+        def __getitem__(self, idx):
+            return {
+                "input_ids": torch.randint(0, 1000, (L,)),
+                "attention_mask": torch.ones(L, dtype=torch.long),
+                "actions": torch.randn(T, H, A),
+                "proprio": torch.randn(T, P),
+                "prev_actions": torch.randn(T, A),
+                "phase_labels": torch.randint(0, 4, (T,)),
+                "embodiment_id": torch.tensor(0, dtype=torch.long),
+                "num_cameras": 3,
+            }
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=2e-4,
+    )
+    loader = DataLoader(MultiCamDummyDataset(steps * B), batch_size=B,
+                        shuffle=True, drop_last=True)
+
+    model.train()
+    for step_i, batch in enumerate(loader):
+        if step_i >= steps:
+            break
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+        ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+               if device.type == "cuda"
+               else torch.autocast("cpu", enabled=False))
+        with ctx:
+            losses = model.forward_train(batch)
+        losses["loss_total"].backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if step_i % 5 == 0:
+            log.info(f"[multi-cam] Step {step_i} | loss: {losses['loss_total'].item():.4f}")
+
+    log.info("Multi-camera smoke test PASSED — no NaN, no crash.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--stage", type=str, default="a", choices=["a", "b", "c"])
+    parser.add_argument("--multi-camera", action="store_true",
+                        help="Run multi-camera smoke test instead of standard")
     args = parser.parse_args()
-    train(steps=args.steps, stage=args.stage)
+    if args.multi_camera:
+        train_multi_camera(steps=args.steps)
+    else:
+        train(steps=args.steps, stage=args.stage)
 
 
 if __name__ == "__main__":
