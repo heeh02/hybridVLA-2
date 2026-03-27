@@ -51,7 +51,7 @@ class BackboneConfig:
 
 @dataclass
 class MultiCameraConfig:
-    enable: bool = True
+    enable: bool = False  # NOT YET IMPLEMENTED — set True when multi-camera adapter is ready
     num_cameras: int = 3
     camera_names: List[str] = field(default_factory=lambda: [
         "wrist", "shoulder", "overhead",
@@ -209,6 +209,8 @@ class TrainConfig:
     max_steps: int = 120000
     warmup_steps: int = 3000
     learning_rate: float = 2e-4
+    backbone_lr_scale: float = 0.1  # v0.10.5: backbone LoRA LR = learning_rate × scale
+    expert_lr_scale: float = 0.5  # v0.10.5: expert LR = learning_rate × scale (Stage B/C)
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     optimizer: str = "adamw_torch_fused"
@@ -300,6 +302,8 @@ class DataConfig:
     embodiment_id: int = 0
     max_episodes: Optional[int] = None
     normalizer_stats_dir: Optional[str] = None  # v0.10.1: explicit path; falls back to {output_dir}/normalizer_stats
+    val_data_dir: Optional[str] = None  # v0.10.5: separate val data directory; if None, split by episode ratio
+    val_ratio: float = 0.1  # fraction of episodes for val when val_data_dir is None
     # v2: multi-camera
     camera_keys: List[str] = field(default_factory=lambda: [
         "agentview_rgb", "wrist_rgb", "overhead_rgb",

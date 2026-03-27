@@ -69,16 +69,37 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
         self.image_key = cfg.data.image_key  # e.g. "agentview_rgb"
 
         # Discover episode files
-        data_dir = Path(self.dcfg.data_dir) if self.dcfg.data_dir else None
-        if self.dcfg.paths:
-            self.episode_paths = [Path(p) for p in self.dcfg.paths]
-        elif data_dir and data_dir.exists():
-            self.episode_paths = sorted(data_dir.glob("*.hdf5"))
+        # V1 fix: val split uses separate dir or episode-ratio split
+        if split == "val" and self.dcfg.val_data_dir:
+            val_dir = Path(self.dcfg.val_data_dir)
+            if val_dir.exists():
+                self.episode_paths = sorted(val_dir.glob("*.hdf5"))
+            else:
+                raise FileNotFoundError(
+                    f"val_data_dir does not exist: {self.dcfg.val_data_dir}"
+                )
         else:
-            raise FileNotFoundError(
-                f"No data found. Set data.paths or data.data_dir in config. "
-                f"data_dir={self.dcfg.data_dir}"
-            )
+            data_dir = Path(self.dcfg.data_dir) if self.dcfg.data_dir else None
+            if self.dcfg.paths:
+                all_paths = [Path(p) for p in self.dcfg.paths]
+            elif data_dir and data_dir.exists():
+                all_paths = sorted(data_dir.glob("*.hdf5"))
+            else:
+                raise FileNotFoundError(
+                    f"No data found. Set data.paths or data.data_dir in config. "
+                    f"data_dir={self.dcfg.data_dir}"
+                )
+            # Episode-ratio split when no separate val_data_dir
+            if split == "val" and not self.dcfg.val_data_dir:
+                n_val = max(1, int(len(all_paths) * self.dcfg.val_ratio))
+                self.episode_paths = all_paths[-n_val:]  # last N episodes
+            else:
+                if self.dcfg.val_data_dir is None and split == "train":
+                    # Exclude val episodes from train set
+                    n_val = max(1, int(len(all_paths) * self.dcfg.val_ratio))
+                    self.episode_paths = all_paths[:-n_val] if n_val < len(all_paths) else all_paths
+                else:
+                    self.episode_paths = all_paths
 
         if self.dcfg.max_episodes:
             self.episode_paths = self.episode_paths[: self.dcfg.max_episodes]
@@ -153,6 +174,13 @@ class HDF5DatasetAdapter(BaseDatasetAdapter):
         pixel_values / image_grid_thw.
         """
         if self.processor is not None and pil_image is not None:
+            # P0-3 fix: Force uniform image size so all samples produce the
+            # same N_patches, preventing torch.stack crash in collate.
+            # 448×448 = 200704 = min_pixels → deterministic patch count.
+            _TARGET = (448, 448)
+            if pil_image.size != _TARGET:
+                pil_image = pil_image.resize(_TARGET, Image.BILINEAR)
+            pil_image = pil_image.convert("RGB")
             # Joint text+image — Qwen2-VL processor handles image tokens
             tok = self.processor(
                 text=lang, images=pil_image,

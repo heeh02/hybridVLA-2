@@ -24,7 +24,7 @@ model:
         - down_proj
 
   multi_camera:
-    enable: true
+    enable: false
     num_cameras: 3
     camera_names: [wrist, shoulder, overhead]
 

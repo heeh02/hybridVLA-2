@@ -81,6 +81,184 @@ def setup_logging(log_dir: Optional[str] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stage gate: explicit module freeze/unfreeze per training stage (P0-1a)
+# ---------------------------------------------------------------------------
+
+def configure_trainable_modules(
+    model: torch.nn.Module, stage: str, cfg: HybridVLAv2Config,
+) -> None:
+    """Explicitly set requires_grad per module based on training stage.
+
+    Replaces the old implicit approach that relied on PyTorch defaults.
+    Called before FSDP wrapping and optimizer creation.
+    """
+    # Step 1: freeze everything
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # Step 2: re-enable backbone LoRA (trainable in all stages)
+    for name, p in model.backbone.named_parameters():
+        if "lora" in name.lower():
+            p.requires_grad = True
+
+    # Step 3: re-enable backbone multi-scale adapter
+    if hasattr(model.backbone, "multi_scale_adapter"):
+        for p in model.backbone.multi_scale_adapter.parameters():
+            p.requires_grad = True
+
+    # Step 4: modules trainable in ALL stages (A/B/C)
+    # M2: include loss modules in case they gain learnable params later
+    always_trainable = [
+        model.grounder,
+        model.temporal_core,
+        model.action_history_encoder,
+        model.proprio_proj,
+        model.prev_action_proj,
+        model.embodiment_embedding,
+        model.fast_head,
+        model.phase_head,
+        model.affordance_head,
+        model.consistency_loss,
+        model.flow_matching_loss,
+        model.discrete_loss,
+        model.phase_loss,
+    ]
+    for mod in always_trainable:
+        if mod is not None:
+            for p in mod.parameters():
+                p.requires_grad = True
+
+    # Step 5: Stage B/C — unfreeze expert + bridging projections
+    if stage in ("b", "c"):
+        extra_modules = [
+            model.action_expert,
+            model.cond_builder,
+            model.core_to_expert,
+            model.proprio_to_expert,
+            model.emb_to_expert,
+        ]
+        for mod in extra_modules:
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad = True
+
+    # Step 6: Stage C — unfreeze backbone text layers 16-27
+    if stage == "c":
+        freeze_until = cfg.model.backbone.freeze_text_layers_until  # 16
+        for name, p in model.backbone.named_parameters():
+            for layer_idx in range(freeze_until, 28):
+                if f"layers.{layer_idx}." in name:
+                    p.requires_grad = True
+                    break
+
+    logger.info("Stage %s: configured trainable modules (explicit gate).", stage.upper())
+
+
+def sanity_check_trainable_params(
+    model: torch.nn.Module, stage: str,
+) -> None:
+    """Assert trainable parameters match stage expectations (P0-1b)."""
+    module_entries = [
+        ("backbone", model.backbone),
+        ("grounder", model.grounder),
+        ("temporal_core", model.temporal_core),
+        ("action_history_encoder", model.action_history_encoder),
+        ("action_expert", model.action_expert),
+        ("fast_head", model.fast_head),
+        ("phase_head", model.phase_head),
+        ("affordance_head", model.affordance_head),
+        ("proprio_proj", model.proprio_proj),
+        ("prev_action_proj", model.prev_action_proj),
+        ("embodiment_embedding", model.embodiment_embedding),
+        ("cond_builder", model.cond_builder),
+        ("core_to_expert", model.core_to_expert),
+        ("consistency_loss", model.consistency_loss),
+    ]
+    logger.info("Per-module trainable parameters:")
+    for name, mod in module_entries:
+        if mod is None:
+            logger.info("  %-30s (absent)", name)
+            continue
+        total = sum(p.numel() for p in mod.parameters())
+        train = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+        pct = 100.0 * train / max(total, 1)
+        logger.info("  %-30s trainable=%12s  frozen=%12s  (%.1f%%)",
+                     name, f"{train:,}", f"{total - train:,}", pct)
+
+    # --- Stage-specific assertions ---
+    expert_trainable = sum(
+        p.numel() for p in model.action_expert.parameters() if p.requires_grad
+    )
+    expert_total = sum(p.numel() for p in model.action_expert.parameters())
+
+    if stage == "a":
+        assert expert_trainable == 0, (
+            f"Stage A: action_expert should be frozen but has "
+            f"{expert_trainable:,} trainable params"
+        )
+        cond_trainable = sum(
+            p.numel() for p in model.cond_builder.parameters()
+            if p.requires_grad
+        )
+        assert cond_trainable == 0, (
+            f"Stage A: cond_builder should be frozen but has "
+            f"{cond_trainable:,} trainable params"
+        )
+    elif stage in ("b", "c"):
+        assert expert_trainable == expert_total, (
+            f"Stage {stage.upper()}: action_expert should be fully trainable "
+            f"but {expert_trainable:,}/{expert_total:,} are trainable"
+        )
+
+    # Backbone LoRA must always be trainable
+    lora_trainable = sum(
+        p.numel() for n, p in model.backbone.named_parameters()
+        if "lora" in n.lower() and p.requires_grad
+    )
+    lora_total = sum(
+        p.numel() for n, p in model.backbone.named_parameters()
+        if "lora" in n.lower()
+    )
+    if lora_total > 0:
+        assert lora_trainable == lora_total, (
+            f"Backbone LoRA should be fully trainable but "
+            f"{lora_trainable:,}/{lora_total:,} are trainable"
+        )
+
+    logger.info("Sanity check passed for Stage %s.", stage.upper())
+
+
+# ---------------------------------------------------------------------------
+# Per-module gradient norm (V5)
+# ---------------------------------------------------------------------------
+
+_GRAD_MODULES = [
+    "backbone", "grounder", "temporal_core", "action_history_encoder",
+    "action_expert", "fast_head", "phase_head", "affordance_head",
+    "cond_builder",
+]
+
+
+def _log_per_module_grad_norm(model: torch.nn.Module) -> None:
+    """Log L2 gradient norm per major sub-module."""
+    parts = []
+    for mod_name in _GRAD_MODULES:
+        mod = getattr(model, mod_name, None)
+        if mod is None:
+            continue
+        sq_sum = 0.0
+        count = 0
+        for p in mod.parameters():
+            if p.requires_grad and p.grad is not None:
+                sq_sum += p.grad.detach().norm(2).item() ** 2
+                count += 1
+        if count > 0:
+            parts.append(f"{mod_name}={sq_sum ** 0.5:.3f}")
+    if parts:
+        logger.info("  grad_norm: %s", " | ".join(parts))
+
+
+# ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
 
@@ -144,17 +322,9 @@ def train(cfg: HybridVLAv2Config) -> None:
     from vla_hybrid_v2.models.hybrid_vla_v2 import HybridVLAv2
     model = HybridVLAv2(cfg)
 
-    # Stage-gated freezing
-    if stage == "a":
-        for p in model.action_expert.parameters():
-            p.requires_grad = False
-        logger.info("Stage A: action_expert frozen.")
-    elif stage == "b":
-        # Expert unfrozen; backbone LoRA stays trainable
-        logger.info("Stage B: all trainable (expert unfrozen, cond_prefix detached).")
-    else:
-        # Stage C: full fine-tune
-        logger.info("Stage C: full fine-tune.")
+    # P0-1: Explicit stage gate (replaces old implicit if/elif/else)
+    configure_trainable_modules(model, stage, cfg)
+    sanity_check_trainable_params(model, stage)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -168,25 +338,38 @@ def train(cfg: HybridVLAv2Config) -> None:
         model = wrap_fsdp(model, mixed_precision=cfg.train.bf16,
                           use_activation_checkpointing=cfg.train.checkpointing)
 
-    # ---- Optimizer (exclude res_scale/bias/LN from weight decay) ----
+    # ---- Optimizer: per-module LR + weight decay groups (V4) ----
+    base_lr = cfg.train.learning_rate
     no_decay_keywords = {"bias", "res_scale", "LayerNorm.weight", "layer_norm.weight"}
-    decay_params = []
-    no_decay_params = []
+
+    # Classify each param into (module_group, decay/no_decay)
+    param_groups_map: Dict[str, Dict[str, list]] = {}
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(nd in name for nd in no_decay_keywords):
-            no_decay_params.append(param)
+        # Determine module group and LR scale
+        if name.startswith("backbone"):
+            group = "backbone"
+            lr_scale = cfg.train.backbone_lr_scale
+        elif name.startswith("action_expert"):
+            group = "expert"
+            lr_scale = cfg.train.expert_lr_scale
         else:
-            decay_params.append(param)
-    logger.info("Optimizer: %d decay params, %d no-decay params",
-                len(decay_params), len(no_decay_params))
+            group = "core"
+            lr_scale = 1.0
+        is_no_decay = any(nd in name for nd in no_decay_keywords)
+        key = f"{group}_{'nodecay' if is_no_decay else 'decay'}"
+        if key not in param_groups_map:
+            param_groups_map[key] = {"params": [], "lr": base_lr * lr_scale,
+                                     "weight_decay": 0.0 if is_no_decay else cfg.train.weight_decay}
+        param_groups_map[key]["params"].append(param)
+
+    param_groups = list(param_groups_map.values())
+    for key, pg in param_groups_map.items():
+        logger.info("  optim group %-20s  %4d params  lr=%.2e  wd=%.4f",
+                     key, len(pg["params"]), pg["lr"], pg["weight_decay"])
     optimizer = torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": cfg.train.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=cfg.train.learning_rate, betas=(0.9, 0.95),
+        param_groups, lr=base_lr, betas=(0.9, 0.95),
         fused=torch.cuda.is_available(),
     )
 
@@ -316,6 +499,9 @@ def train(cfg: HybridVLAv2Config) -> None:
                     parts = " | ".join(f"{k}: {v:.4f}" for k, v in avg.items())
                     logger.info("Step %d | %s | gnorm: %.3f | lr: %.2e | %.1f sps",
                                 global_step, parts, grad_norm.item(), lr, sps)
+                    # V5: per-module gradient norm (every 5× log_interval to limit overhead)
+                    if global_step % (cfg.train.log_interval * 5) == 0:
+                        _log_per_module_grad_norm(model)
                     accum_loss.clear()
                     step_start = time.monotonic()
 

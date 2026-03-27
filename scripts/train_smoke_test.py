@@ -149,9 +149,13 @@ def train(steps: int = 20, stage: str = "a"):
         from vla_hybrid_v2.models.hybrid_vla_v2 import HybridVLAv2
         model = HybridVLAv2(cfg)
 
-    if stage == "a":
-        for p in model.action_expert.parameters():
-            p.requires_grad = False
+    # P0-1: Use the same explicit stage gate as train_unified.py
+    from scripts.train_unified import (
+        configure_trainable_modules,
+        sanity_check_trainable_params,
+    )
+    configure_trainable_modules(model, stage, cfg)
+    sanity_check_trainable_params(model, stage)
 
     model = model.to(device)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -166,8 +170,18 @@ def train(steps: int = 20, stage: str = "a"):
     dataset = DummyVLADataset(size=steps * B)
     loader = DataLoader(dataset, batch_size=B, shuffle=True, drop_last=True)
 
+    # M4: snapshot expert params before training (for Stage B/C assertion)
+    expert_snapshot = None
+    if stage in ("b", "c"):
+        expert_snapshot = {
+            n: p.data.clone()
+            for n, p in model.action_expert.named_parameters()
+            if p.requires_grad
+        }
+
     model.train()
     t0 = time.monotonic()
+    seen_loss_fm = False
     for step_i, batch in enumerate(loader):
         if step_i >= steps:
             break
@@ -177,6 +191,9 @@ def train(steps: int = 20, stage: str = "a"):
         ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else torch.autocast("cpu", enabled=False)
         with ctx:
             losses = model.forward_train(batch)
+
+        if "loss_fm" in losses:
+            seen_loss_fm = True
 
         loss = losses["loss_total"]
         loss.backward()
@@ -193,6 +210,21 @@ def train(steps: int = 20, stage: str = "a"):
 
     elapsed = time.monotonic() - t0
     log.info(f"Done: {steps} steps in {elapsed:.1f}s ({steps / elapsed:.1f} steps/s)")
+
+    # M4: Stage B/C assertions
+    if stage in ("b", "c"):
+        assert seen_loss_fm, (
+            f"Stage {stage.upper()}: loss_fm should be present but was never produced"
+        )
+        # Verify expert params actually changed
+        for n, p in model.action_expert.named_parameters():
+            if p.requires_grad and n in expert_snapshot:
+                assert not torch.equal(p.data, expert_snapshot[n]), (
+                    f"Stage {stage.upper()}: expert param '{n}' did not change after {steps} steps"
+                )
+                break  # one param changing is sufficient proof
+        log.info("Stage %s assertions PASSED: loss_fm present, expert params updated.", stage.upper())
+
     log.info("Smoke test PASSED — no NaN, no crash.")
 
 
