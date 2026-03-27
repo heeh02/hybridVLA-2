@@ -1,0 +1,15 @@
+# HybridVLA v2 — Core Dependencies
+torch>=2.1.0
+transformers>=4.37.0
+peft>=0.7.0
+pyyaml>=6.0
+numpy>=1.24.0
+h5py>=3.8.0
+
+# Optional: official Mamba-2 CUDA kernels (recommended for training)
+# mamba_ssm>=2.0.0
+# causal_conv1d>=1.2.0
+
+# Optional: training utilities
+# wandb
+# tensorboard

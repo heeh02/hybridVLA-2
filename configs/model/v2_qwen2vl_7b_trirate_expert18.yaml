@@ -1,0 +1,84 @@
+model:
+  backbone:
+    name: Qwen/Qwen2-VL-7B-Instruct
+    torch_dtype: bfloat16
+    attn_implementation: flash_attention_2
+    min_pixels: 200704
+    max_pixels: 401408
+    freeze_vision_tower: true
+    freeze_text_layers_until: 16
+    multi_scale_layers: [10, 18, 28]
+    output_dim: 2048
+    lora:
+      enable: true
+      rank: 64
+      alpha: 128
+      dropout: 0.05
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+
+  multi_camera:
+    enable: true
+    num_cameras: 3
+    camera_names: [wrist, shoulder, overhead]
+
+  grounder:
+    hidden_size: 2048
+    num_latents: 96
+    num_object_slots: 48
+    compressed_slots: 24
+    num_layers: 8
+    num_heads: 16
+    mlp_ratio: 4.0
+    hierarchical_compression: true
+    compression_layer: 4
+
+  temporal_core:
+    d_model: 2048
+    fast_layers: 20
+    medium_layers: 6
+    slow_layers: 10
+    fast_d_state: 128
+    medium_d_state: 128
+    slow_d_state: 256
+    d_conv: 4
+    expand: 2
+    fusion_type: cross_attention
+    fusion_heads: 8
+    fusion_layers: 2
+    action_history_len: 8
+    action_history_layers: 4
+    action_history_d_state: 64
+
+  action_expert:
+    d_model: 1536
+    num_layers: 18
+    num_heads: 24
+    d_state: 96
+    d_conv: 4
+    expand: 2
+    chunk_horizon: 24
+    cond_tokens: 32
+    cond_dim: 2048
+    action_dim: 14
+    ada_rmsnorm: true
+    ode_solver: midpoint
+
+  heads:
+    fast_discrete_head: true
+    fast_vocab_size: 512
+    phase_head: true
+    num_phases: 16
+    affordance_head: true
+
+  ema:
+    enable: true
+    initial_decay: 0.999
+    final_decay: 0.9999
+    ramp_steps: 20000
