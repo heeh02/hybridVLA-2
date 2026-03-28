@@ -15,8 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from vla_hybrid_v2.world_model.visual_decoder import WorldDecoderLoss
-from vla_hybrid_v2.world_model.world_model_heads import SymlogTwoHot
+from vla_hybrid_v2.experimental.world_model.visual_decoder import WorldDecoderLoss
+from vla_hybrid_v2.experimental.world_model.world_model_heads import SymlogTwoHot
 
 
 class KLLoss(nn.Module):

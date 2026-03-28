@@ -17,13 +17,13 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
-from vla_hybrid_v2.world_model.imagination_mamba import ImaginationMamba
-from vla_hybrid_v2.world_model.noise_augmentation import NoiseAugmentation
-from vla_hybrid_v2.world_model.object_physics import ObjectPhysicsEngine
-from vla_hybrid_v2.world_model.stochastic_state import StochasticStateModule
-from vla_hybrid_v2.world_model.subgoal_planner import LatentSubgoalPlanner
-from vla_hybrid_v2.world_model.visual_decoder import CNNWorldDecoder
-from vla_hybrid_v2.world_model.world_model_heads import WorldModelHeads
+from vla_hybrid_v2.experimental.world_model.imagination_mamba import ImaginationMamba
+from vla_hybrid_v2.experimental.world_model.noise_augmentation import NoiseAugmentation
+from vla_hybrid_v2.experimental.world_model.object_physics import ObjectPhysicsEngine
+from vla_hybrid_v2.experimental.world_model.stochastic_state import StochasticStateModule
+from vla_hybrid_v2.experimental.world_model.subgoal_planner import LatentSubgoalPlanner
+from vla_hybrid_v2.experimental.world_model.visual_decoder import CNNWorldDecoder
+from vla_hybrid_v2.experimental.world_model.world_model_heads import WorldModelHeads
 
 
 @dataclass
