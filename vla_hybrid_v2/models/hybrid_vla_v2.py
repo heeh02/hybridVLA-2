@@ -95,13 +95,16 @@ class HybridVLAv2(nn.Module):
             fusion_type=tcfg.fusion_type,
             fusion_heads=tcfg.fusion_heads,
             fusion_layers=tcfg.fusion_layers,
+            mamba_impl=tcfg.mamba_impl,
         )
 
+        _force_fb = (tcfg.mamba_impl == "fallback")
         self.action_history_encoder = ActionHistoryEncoder(
             action_dim=mcfg.action_expert.action_dim,
             d_model=d_core,
             d_state=tcfg.action_history_d_state,
             num_layers=tcfg.action_history_layers,
+            force_fallback=_force_fb,
         )
 
         ecfg = mcfg.action_expert
@@ -136,6 +139,23 @@ class HybridVLAv2(nn.Module):
             self.affordance_head = AffordanceHead(
                 input_dim=d_core,
                 num_affordance_types=mcfg.heads.num_affordance_types,
+            )
+
+        # L-15: warn if phase/affordance heads are enabled — they require
+        # labels from the data adapter (phase_labels / affordance_labels).
+        # Real adapters (HDF5/LIBERO) currently do not produce these labels,
+        # so the heads will receive no supervision and their tokens in
+        # cond_prefix will carry no learned semantics.
+        if self.phase_head is not None:
+            logger.warning(
+                "PhaseHead is enabled but requires 'phase_labels' in each "
+                "batch. Ensure your data adapter provides them, otherwise "
+                "the head receives zero loss and its cond_prefix token is noise."
+            )
+        if self.affordance_head is not None:
+            logger.warning(
+                "AffordanceHead is enabled but requires 'affordance_labels' "
+                "in each batch. Ensure your data adapter provides them."
             )
 
         # ---- Projections ----
@@ -177,17 +197,22 @@ class HybridVLAv2(nn.Module):
         # v0.9.2: label_smoothing from config (was hardcoded 0.1)
         self.discrete_loss = DiscreteCELoss(label_smoothing=mcfg.heads.label_smoothing)
         self.phase_loss = PhaseLoss()
-        self.consistency_loss = V2ConsistencyLoss(ecfg.action_dim)
+        self.consistency_loss = V2ConsistencyLoss(
+            action_dim=ecfg.action_dim,
+            temperature=cfg.train.consistency_temperature,
+            slow_fast_weight=cfg.train.consistency_slow_fast_weight,
+            action_weight=cfg.train.consistency_action_weight,
+        )
 
         # ---- World Model (v0.4 integration) ----
         self.imagination_engine = None
         self.world_model_loss_fn = None
         wmcfg = mcfg.world_model
         if wmcfg.enable:
-            from vla_hybrid_v2.world_model.imagination_engine import (
+            from vla_hybrid_v2.experimental.world_model.imagination_engine import (
                 ImaginationEngine,
             )
-            from vla_hybrid_v2.world_model.world_model_loss import WorldModelLoss
+            from vla_hybrid_v2.experimental.world_model.world_model_loss import WorldModelLoss
 
             self.imagination_engine = ImaginationEngine(
                 d_model=wmcfg.d_model,
@@ -255,6 +280,12 @@ class HybridVLAv2(nn.Module):
                               device=cond.device, dtype=cond.dtype)
             cond = torch.cat([cond, pad], dim=1)
         elif cond.shape[1] > target_c:
+            logger.warning(
+                "_build_cond_prefix: truncating %d → %d tokens. "
+                "Temporal tokens beyond target_c=%d are discarded — "
+                "consider increasing action_expert.cond_tokens.",
+                cond.shape[1], target_c, target_c,
+            )
             cond = cond[:, :target_c, :]
 
         return self.core_to_expert(cond)
@@ -275,69 +306,76 @@ class HybridVLAv2(nn.Module):
 
         # Required keys
         for key in ("actions", "proprio", "prev_actions", "input_ids", "attention_mask"):
-            assert key in batch, f"Missing required batch key: '{key}'"
+            if key not in batch or batch[key] is None:
+                raise ValueError(f"Missing required batch key: '{key}'")
 
         actions = batch["actions"]
-        assert actions.dim() == 4, (
-            f"actions must be [B, T, H, A], got {actions.shape}"
-        )
-        assert actions.shape[2] == ecfg.chunk_horizon, (
-            f"actions horizon={actions.shape[2]}, expected {ecfg.chunk_horizon}"
-        )
-        assert actions.shape[3] == ecfg.action_dim, (
-            f"actions dim={actions.shape[3]}, expected {ecfg.action_dim}"
-        )
+        if actions.dim() != 4:
+            raise ValueError(f"actions must be [B, T, H, A], got {actions.shape}")
+        if actions.shape[2] != ecfg.chunk_horizon:
+            raise ValueError(
+                f"actions horizon={actions.shape[2]}, expected {ecfg.chunk_horizon}"
+            )
+        if actions.shape[3] != ecfg.action_dim:
+            raise ValueError(
+                f"actions dim={actions.shape[3]}, expected {ecfg.action_dim}"
+            )
 
         proprio = batch["proprio"]
-        assert proprio.dim() == 3, (
-            f"proprio must be [B, T, P], got {proprio.shape}"
-        )
-        assert proprio.shape[2] == mcfg.proprio_dim, (
-            f"proprio dim={proprio.shape[2]}, expected {mcfg.proprio_dim}"
-        )
+        if proprio.dim() != 3:
+            raise ValueError(f"proprio must be [B, T, P], got {proprio.shape}")
+        if proprio.shape[2] != mcfg.proprio_dim:
+            raise ValueError(
+                f"proprio dim={proprio.shape[2]}, expected {mcfg.proprio_dim}"
+            )
 
         prev_actions = batch["prev_actions"]
-        assert prev_actions.dim() == 3 and prev_actions.shape[2] == ecfg.action_dim, (
-            f"prev_actions must be [B, T, {ecfg.action_dim}], got {prev_actions.shape}"
-        )
+        if prev_actions.dim() != 3 or prev_actions.shape[2] != ecfg.action_dim:
+            raise ValueError(
+                f"prev_actions must be [B, T, {ecfg.action_dim}], got {prev_actions.shape}"
+            )
 
         # v0.9.3: T consistency across temporal fields
         T_act = actions.shape[1]
-        assert proprio.shape[1] == T_act, (
-            f"proprio T={proprio.shape[1]} != actions T={T_act}"
-        )
-        assert prev_actions.shape[1] == T_act, (
-            f"prev_actions T={prev_actions.shape[1]} != actions T={T_act}"
-        )
+        if proprio.shape[1] != T_act:
+            raise ValueError(f"proprio T={proprio.shape[1]} != actions T={T_act}")
+        if prev_actions.shape[1] != T_act:
+            raise ValueError(
+                f"prev_actions T={prev_actions.shape[1]} != actions T={T_act}"
+            )
 
         # v0.9.3: input_ids and attention_mask must match
-        assert batch["input_ids"].shape == batch["attention_mask"].shape, (
-            f"input_ids shape {batch['input_ids'].shape} != "
-            f"attention_mask shape {batch['attention_mask'].shape}"
-        )
+        if batch["input_ids"].shape != batch["attention_mask"].shape:
+            raise ValueError(
+                f"input_ids shape {batch['input_ids'].shape} != "
+                f"attention_mask shape {batch['attention_mask'].shape}"
+            )
 
         # v0.9.3: pixel_values and image_grid_thw must co-occur
-        has_pv = "pixel_values" in batch and batch["pixel_values"] is not None
-        has_thw = "image_grid_thw" in batch and batch["image_grid_thw"] is not None
-        assert has_pv == has_thw, (
-            "pixel_values and image_grid_thw must both be present or both absent"
-        )
+        has_pv = batch.get("pixel_values") is not None
+        has_thw = batch.get("image_grid_thw") is not None
+        if has_pv != has_thw:
+            raise ValueError(
+                "pixel_values and image_grid_thw must both be present or both absent"
+            )
 
         # v0.10.2: step_weights shape check
-        if "step_weights" in batch and batch["step_weights"] is not None:
-            sw = batch["step_weights"]
-            assert sw.shape == (actions.shape[0], ecfg.chunk_horizon), (
-                f"step_weights must be [B, H]=[{actions.shape[0]}, {ecfg.chunk_horizon}], "
-                f"got {sw.shape}"
-            )
+        sw = batch.get("step_weights")
+        if sw is not None:
+            if sw.shape != (actions.shape[0], ecfg.chunk_horizon):
+                raise ValueError(
+                    f"step_weights must be [B, H]=[{actions.shape[0]}, {ecfg.chunk_horizon}], "
+                    f"got {sw.shape}"
+                )
 
         # v0.9.3: embodiment_id range check
-        if "embodiment_id" in batch:
-            emb = batch["embodiment_id"]
-            assert emb.max() < mcfg.num_embodiments, (
-                f"embodiment_id max={emb.max().item()} >= "
-                f"num_embodiments={mcfg.num_embodiments}"
-            )
+        emb = batch.get("embodiment_id")
+        if emb is not None:
+            if emb.max() >= mcfg.num_embodiments:
+                raise ValueError(
+                    f"embodiment_id max={emb.max().item()} >= "
+                    f"num_embodiments={mcfg.num_embodiments}"
+                )
 
     # ------------------------------------------------------------------
     # Training forward
@@ -351,7 +389,7 @@ class HybridVLAv2(nn.Module):
         stage = self.cfg.stage
 
         # ---- Semantic refresh schedule ----
-        if "semantic_refresh_steps" in batch:
+        if batch.get("semantic_refresh_steps") is not None:
             refresh_steps: List[int] = batch["semantic_refresh_steps"]
         else:
             stride = self.cfg.train.semantic_refresh_stride
@@ -371,13 +409,13 @@ class HybridVLAv2(nn.Module):
 
         # ---- Multi-camera: resolve num_cameras ----
         num_cameras = 1
-        if "num_cameras" in batch and batch["num_cameras"] is not None:
-            nc = batch["num_cameras"]
+        nc = batch.get("num_cameras")
+        if nc is not None:
             num_cameras = int(nc[0].item()) if hasattr(nc, '__getitem__') else int(nc)
 
         # ---- Backbone + Grounder per refresh point ----
         grounder_outputs: List[GrounderOutput] = []
-        if "refresh_input_ids" in batch:
+        if batch.get("refresh_input_ids") is not None:
             for r in range(R):
                 backbone_out = self.backbone.forward_semantic(
                     input_ids=batch["refresh_input_ids"][:, r],
@@ -506,7 +544,7 @@ class HybridVLAv2(nn.Module):
             fast_continuous = (fast_probs * self._fast_bin_centers).sum(dim=-1)
 
         # Phase loss — all T steps
-        if self.phase_head is not None and "phase_labels" in batch:
+        if self.phase_head is not None and batch.get("phase_labels") is not None:
             phase_losses = []
             for t_sup in range(T):
                 r = refresh_map[t_sup]
@@ -518,7 +556,7 @@ class HybridVLAv2(nn.Module):
             losses["loss_phase"] = torch.stack(phase_losses).mean() * weights.get("phase", 0.5)
 
         # Affordance loss — all T steps
-        if self.affordance_head is not None and "affordance_labels" in batch:
+        if self.affordance_head is not None and batch.get("affordance_labels") is not None:
             aff_losses = []
             for t_sup in range(T):
                 r = refresh_map[t_sup]
@@ -591,10 +629,17 @@ class HybridVLAv2(nn.Module):
                 H = self.cfg.model.action_expert.chunk_horizon
 
                 if overlap < H and overlap < exec_H:
-                    # Generate a "previous chunk" with fast low-precision sampling
+                    # Generate a "previous chunk" with fast low-precision sampling.
+                    # NOTE (L-5): Ideally prev_chunk should use a *different*
+                    # cond_prefix (from a prior timestep) to match inference
+                    # semantics. As a pragmatic approximation, we add small
+                    # noise to cond_prefix to break self-consistency and
+                    # encourage cross-boundary robustness.
                     with torch.no_grad():
+                        noise_scale = 0.01
+                        prev_cond = cond_prefix + noise_scale * torch.randn_like(cond_prefix)
                         prev_chunk = self.action_expert.sample(
-                            cond_prefix=cond_prefix,
+                            cond_prefix=prev_cond,
                             proprio_token=proprio_for_expert,
                             embodiment_token=emb_for_expert,
                             num_steps=rtc_cfg.prev_chunk_steps,
@@ -651,7 +696,7 @@ class HybridVLAv2(nn.Module):
                 slow_token=temporal_outputs[-1].slow_token,
             ) * weights.get("consistency", 0.3)
 
-        losses["loss_total"] = sum(losses.values())
+        losses["loss_total"] = torch.stack(list(losses.values())).sum()
         return losses
 
     # ------------------------------------------------------------------
@@ -690,8 +735,8 @@ class HybridVLAv2(nn.Module):
             if self.cfg.infer.faster.enable:
                 raise NotImplementedError(
                     "cfg.infer.faster.enable=True but FASTER inference is not "
-                    "implemented yet. Disable infer.faster or implement a "
-                    "matching inference schedule first."
+                    "implemented yet. FASTER is train-only (Stage C). "
+                    "Set infer.faster.enable=False to use standard sampling."
                 )
 
             # ---- Check if cached chunk is still valid ----

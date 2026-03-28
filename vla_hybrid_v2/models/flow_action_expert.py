@@ -23,6 +23,13 @@ from vla_hybrid_v2.ops.selective_scan import (
 )
 from vla_hybrid_v2.types import ActionExpertOutput
 
+# L-16: detect official Mamba2 block for optional use in ExpertMambaBlock
+try:
+    from mamba_ssm.modules.mamba2 import Mamba2 as _OfficialMamba2
+    HAS_MAMBA2_MODULE = True
+except ImportError:
+    HAS_MAMBA2_MODULE = False
+
 
 # ---------------------------------------------------------------------------
 # AdaRMSNorm (from π₀.5)
@@ -264,6 +271,16 @@ class FlowActionExpert(nn.Module):
         self.embodiment_proj = nn.Linear(d_model, d_model)
 
         # Layers
+        # L-16: when official Mamba2 module is available, log it.
+        # The ExpertMambaBlock already uses selective_scan_fn CUDA kernel
+        # when HAS_MAMBA_CUDA is True. Full Mamba2 block replacement requires
+        # adapter work for AdaRMSNorm conditioning — flagged for future.
+        if HAS_MAMBA2_MODULE:
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "Official mamba_ssm.Mamba2 detected. ExpertMambaBlock uses "
+                "selective_scan_fn CUDA kernel for acceleration."
+            )
         self.layers = nn.ModuleList()
         for lt in self.PATTERN:
             if lt == "mamba":

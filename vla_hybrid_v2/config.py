@@ -94,6 +94,10 @@ class TemporalCoreConfig:
     action_history_len: int = 8
     action_history_layers: int = 4
     action_history_d_state: int = 64
+    # Mamba implementation: "fallback" forces pure-PyTorch path (supports
+    # activation checkpointing, vectorized per-layer forward — recommended
+    # for training). "auto" uses official mamba_ssm when available.
+    mamba_impl: str = "fallback"
 
 
 @dataclass
@@ -248,6 +252,11 @@ class TrainConfig:
         "flow_matching": 1.0,
     })
 
+    # v0.10.10 (L-18): consistency loss sub-weights (previously hardcoded)
+    consistency_temperature: float = 0.1
+    consistency_slow_fast_weight: float = 0.5
+    consistency_action_weight: float = 0.5
+
     rtc: RTCTrainConfig = field(default_factory=RTCTrainConfig)
     faster: FASTERTrainConfig = field(default_factory=FASTERTrainConfig)
 
@@ -364,19 +373,26 @@ def _merge_dict(base: dict, override: dict) -> dict:
 def _dict_to_dataclass(cls, data: dict):
     if not isinstance(data, dict):
         return data
-    field_types = {f.name: f.type for f in cls.__dataclass_fields__.values()}
+    # L-19: use typing.get_type_hints() instead of eval() on raw annotations.
+    # get_type_hints() resolves forward references safely and is static-analysis
+    # friendly.  Falls back to raw __dataclass_fields__ annotations if hints
+    # resolution fails (e.g. missing imports at resolve time).
+    import typing
+    try:
+        resolved_hints = typing.get_type_hints(cls)
+    except Exception:
+        resolved_hints = {}
+    field_names = {f.name for f in cls.__dataclass_fields__.values()}
     kwargs = {}
     for k, v in data.items():
-        if k not in field_types:
+        if k not in field_names:
             # v0.9.2: warn on unknown keys to catch YAML typos early (R2)
             warnings.warn(
                 f"Unknown config key '{k}' in {cls.__name__}, ignored",
                 stacklevel=2,
             )
             continue
-        ft = field_types[k]
-        if isinstance(ft, str):
-            ft = eval(ft, globals(), locals())
+        ft = resolved_hints.get(k, cls.__dataclass_fields__[k].type)
         if isinstance(ft, type) and hasattr(ft, "__dataclass_fields__"):
             kwargs[k] = _dict_to_dataclass(ft, v)
         else:

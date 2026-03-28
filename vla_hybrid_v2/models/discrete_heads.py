@@ -9,8 +9,13 @@ import torch
 from torch import Tensor, nn
 
 
-class FASTDiscreteHead(nn.Module):
-    """FAST head v2: 512 bins, 2048d input, factorized prediction."""
+class DiscreteActionHead(nn.Module):
+    """Discrete action head v2: 512 bins, 2048d input, factorized prediction.
+
+    NOTE (L-17): renamed from FASTDiscreteHead to avoid confusion with
+    pi-0-FAST's autoregressive token generation. This head predicts all
+    [H, A, V] logits in a single forward pass (not token-by-token).
+    """
 
     def __init__(self, input_dim=2048, action_dim=14, vocab_size=512,
                  chunk_horizon=24) -> None:
@@ -74,3 +79,7 @@ class AffordanceHead(nn.Module):
 
     def forward(self, affordance_token: Tensor) -> Tensor:
         return self.type_head(affordance_token)
+
+
+# Backward-compatible alias (L-17)
+FASTDiscreteHead = DiscreteActionHead

@@ -102,11 +102,12 @@ class RuntimeCache:
 
 @dataclass
 class ActionHistoryBuffer:
-    """Ring buffer for the last K actions."""
+    """Ring buffer for the last K actions (index-based, no torch.roll)."""
 
     buffer: Optional[Tensor] = None  # [B, K, A]
     max_len: int = 8
     current_len: int = 0
+    _write_idx: int = 0
 
     def push(self, action: Tensor) -> None:
         """Add an action [B, A] to the buffer."""
@@ -115,15 +116,16 @@ class ActionHistoryBuffer:
             self.buffer = torch.zeros(
                 B, self.max_len, A, device=action.device, dtype=action.dtype
             )
-        if self.current_len < self.max_len:
-            self.buffer[:, self.current_len] = action
-            self.current_len += 1
-        else:
-            self.buffer = torch.roll(self.buffer, -1, dims=1)
-            self.buffer[:, -1] = action
+        self.buffer[:, self._write_idx % self.max_len] = action
+        self._write_idx += 1
+        self.current_len = min(self.current_len + 1, self.max_len)
 
     def get(self) -> Tensor:
-        """Return [B, K, A] with zero-padding for unfilled slots."""
+        """Return [B, K, A] in chronological order with zero-padding for unfilled slots."""
         if self.buffer is None:
             raise RuntimeError("Buffer not initialized. Call push() first.")
-        return self.buffer
+        if self.current_len < self.max_len:
+            return self.buffer
+        # Re-order so oldest is first: [write_idx, write_idx+1, ..., write_idx-1]
+        idx = self._write_idx % self.max_len
+        return torch.cat([self.buffer[:, idx:], self.buffer[:, :idx]], dim=1)

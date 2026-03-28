@@ -94,6 +94,7 @@ class MambaBlock(nn.Module):
         d_state: int = 128,
         d_conv: int = 4,
         expand: int = 2,
+        force_fallback: bool = False,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -106,7 +107,8 @@ class MambaBlock(nn.Module):
         # Works for BOTH official and fallback paths.
         self.res_scale = nn.Parameter(torch.ones(1))
 
-        if HAS_MAMBA_SSM:
+        use_official = HAS_MAMBA_SSM and not force_fallback
+        if use_official:
             # ---- Official Mamba-2 block (CUDA-accelerated) ----
             self.mamba = _OfficialMamba2(
                 d_model=d_model,
@@ -335,10 +337,12 @@ class _MambaStack(nn.Module):
         d_state: int,
         d_conv: int,
         expand: int,
+        force_fallback: bool = False,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            [MambaBlock(d_model, d_state, d_conv, expand) for _ in range(num_layers)]
+            [MambaBlock(d_model, d_state, d_conv, expand, force_fallback=force_fallback)
+             for _ in range(num_layers)]
         )
         self.num_layers = num_layers
         self.d_inner = d_model * expand
@@ -406,20 +410,19 @@ class _MambaStack(nn.Module):
         ssm_states: Optional[List[Tensor]] = None,
         conv_states: Optional[List[Tensor]] = None,
         use_checkpoint: bool = False,
+        stateless: bool = False,
     ) -> Tuple[Tensor, List[Tensor], List[Tensor]]:
         """Process a token sequence and return output + final recurrent states.
 
-        v0.5 fix: When using the official Mamba2 CUDA path, processes the
-        input sequence token-by-token via ``MambaBlock.step()`` so that
-        per-layer SSM/conv states are explicitly captured and returned.
-        This ensures state persists across temporal steps in the VLA
-        Tri-Rate Core (fixing the v0.3-era regression).
-
-        The fallback path already returned states correctly.
+        Parameters
+        ----------
+        stateless : bool
+            When True AND the official CUDA path is active, uses the fused
+            ``Mamba2.forward()`` per-layer instead of the token-by-token
+            ``step()`` loop.  Returned states will be [None, …] — only use
+            this when cross-step state persistence is not needed (e.g.
+            ActionHistoryEncoder).
         """
-        B = x.shape[0] if x.dim() >= 2 else 1
-        L = x.shape[1] if x.dim() == 3 else 1
-        device, dtype = x.device, x.dtype
         uses_official = self.layers[0]._use_official if self.layers else False
 
         if ssm_states is None or conv_states is None:
@@ -429,12 +432,17 @@ class _MambaStack(nn.Module):
             ssm_states_list = list(ssm_states)
             conv_states_list = list(conv_states)
 
+        # --- Official stateless fast-path (fused kernel, no state return) ---
+        if uses_official and stateless:
+            for layer in self.layers:
+                x, _, _ = layer._forward_official(x)
+            empty: List[Tensor] = []
+            return x, empty, empty
+
+        # --- Official stateful path (token-by-token step loop) ---
+        # Only reached when mamba_impl="auto" AND the caller needs states.
+        # Kept for inference where single-token step() is the natural mode.
         if uses_official:
-            # --- v0.5 FIX: token-by-token step() to capture final state ---
-            # Official Mamba2.forward() is fused but returns (out, None, None).
-            # We use .step() per token so states persist across temporal steps.
-            # Cost: loses intra-sequence parallelism (L=33 Python loop), but
-            # still uses CUDA step kernel.  For L≤33 this is acceptable.
             is_single = x.dim() == 2
             if is_single:
                 x = x.unsqueeze(1)
@@ -453,7 +461,7 @@ class _MambaStack(nn.Module):
 
             return out, ssm_states_list, conv_states_list  # type: ignore[return-value]
 
-        # --- Fallback path (already correct) ---
+        # --- Fallback path (vectorized per-layer, supports checkpointing) ---
         new_ssm: List[Tensor] = []
         new_conv: List[Tensor] = []
 
@@ -478,27 +486,30 @@ class FastMamba(_MambaStack):
     """Fast stream — 20 layers, d_state=128. Updated every control step."""
 
     def __init__(
-        self, d_model: int = 2048, d_state: int = 128, d_conv: int = 4, expand: int = 2
+        self, d_model: int = 2048, d_state: int = 128, d_conv: int = 4, expand: int = 2,
+        force_fallback: bool = False,
     ):
-        super().__init__(20, d_model, d_state, d_conv, expand)
+        super().__init__(20, d_model, d_state, d_conv, expand, force_fallback=force_fallback)
 
 
 class MediumMamba(_MambaStack):
     """Medium stream — 6 layers, d_state=128. Updated every 2nd control step."""
 
     def __init__(
-        self, d_model: int = 2048, d_state: int = 128, d_conv: int = 4, expand: int = 2
+        self, d_model: int = 2048, d_state: int = 128, d_conv: int = 4, expand: int = 2,
+        force_fallback: bool = False,
     ):
-        super().__init__(6, d_model, d_state, d_conv, expand)
+        super().__init__(6, d_model, d_state, d_conv, expand, force_fallback=force_fallback)
 
 
 class SlowMamba(_MambaStack):
     """Slow stream — 10 layers, d_state=256. Updated on semantic refresh only."""
 
     def __init__(
-        self, d_model: int = 2048, d_state: int = 256, d_conv: int = 4, expand: int = 2
+        self, d_model: int = 2048, d_state: int = 256, d_conv: int = 4, expand: int = 2,
+        force_fallback: bool = False,
     ):
-        super().__init__(10, d_model, d_state, d_conv, expand)
+        super().__init__(10, d_model, d_state, d_conv, expand, force_fallback=force_fallback)
 
 
 # ---------------------------------------------------------------------------
@@ -508,8 +519,10 @@ class SlowMamba(_MambaStack):
 class ActionHistoryEncoder(nn.Module):
     """Encodes the last K actions into a single summary token.
 
-    Uses a small Mamba stack (4 layers, d_state=64) to process the
-    action history sequence and returns the last hidden state.
+    v0.10.10 (L-11): reduced from 108M params (4-layer Mamba d=2048) to
+    ~1.7M params (2-layer Mamba d=256 + output projection). The input is
+    only 8×14 = 112 floats — a 108M encoder was severely over-parameterized
+    (966K params per input float).
     """
 
     def __init__(
@@ -518,16 +531,23 @@ class ActionHistoryEncoder(nn.Module):
         d_model: int = 2048,
         d_state: int = 64,
         num_layers: int = 4,
+        force_fallback: bool = False,
     ) -> None:
         super().__init__()
-        self.action_proj = nn.Linear(action_dim, d_model)
-        self.stack = _MambaStack(num_layers, d_model, d_state, d_conv=4, expand=2)
+        # Internal Mamba operates at d_inner=256 to keep param count small
+        d_inner = 256
+        self.action_proj = nn.Linear(action_dim, d_inner)
+        self.stack = _MambaStack(
+            min(num_layers, 2), d_inner, d_state, d_conv=4, expand=2,
+            force_fallback=force_fallback,
+        )
+        self.out_proj = nn.Linear(d_inner, d_model)
 
     def encode(self, action_history: Tensor) -> Tensor:
         """action_history: [B, K, A] → action_history_token: [B, D]"""
-        h = self.action_proj(action_history)  # [B, K, D]
-        out, _, _ = self.stack(h)
-        return out[:, -1, :]  # last token as summary
+        h = self.action_proj(action_history)  # [B, K, d_inner]
+        out, _, _ = self.stack(h, stateless=True)
+        return self.out_proj(out[:, -1, :])  # [B, d_model]
 
 
 # ---------------------------------------------------------------------------
@@ -624,13 +644,15 @@ class TriRateMambaCore(nn.Module):
         fusion_type: str = "cross_attention",
         fusion_heads: int = 8,
         fusion_layers: int = 2,
+        mamba_impl: str = "fallback",
     ) -> None:
         super().__init__()
         self.d_model = d_model
+        force_fb = (mamba_impl == "fallback")
 
-        self.fast_mamba = FastMamba(d_model, fast_d_state, d_conv, expand)
-        self.medium_mamba = MediumMamba(d_model, medium_d_state, d_conv, expand)
-        self.slow_mamba = SlowMamba(d_model, slow_d_state, d_conv, expand)
+        self.fast_mamba = FastMamba(d_model, fast_d_state, d_conv, expand, force_fallback=force_fb)
+        self.medium_mamba = MediumMamba(d_model, medium_d_state, d_conv, expand, force_fallback=force_fb)
+        self.slow_mamba = SlowMamba(d_model, slow_d_state, d_conv, expand, force_fallback=force_fb)
 
         # v0.9: Removed redundant stack-level LayerNorm. Each MambaBlock
         # already applies pre-norm (self.norm) inside forward/step.  The

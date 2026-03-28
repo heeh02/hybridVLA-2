@@ -81,6 +81,7 @@ class CameraPositionEmbedding(nn.Module):
             features: [B, N, D] backbone features (text + vision tokens).
             vision_mask: [B, N] bool mask — True for vision tokens.
             image_grid_thw: [num_images, 3] grid dimensions per image.
+                For batch size B with C cameras each, total rows = B * C.
             num_cameras: number of cameras (images are ordered by camera).
 
         Returns:
@@ -89,31 +90,37 @@ class CameraPositionEmbedding(nn.Module):
         if num_cameras <= 1 or image_grid_thw is None:
             return features
 
-        # Compute tokens per image from grid_thw: t * ceil(h/2) * ceil(w/2)
-        # Qwen2-VL merges 2×2 spatial patches, so effective tokens = prod / 4
-        merge_factor = 4  # 2×2 spatial merge
-        tokens_per_image = []
-        for i in range(image_grid_thw.shape[0]):
-            t, h, w = image_grid_thw[i].tolist()
-            tokens_per_image.append(int(t * h * w // merge_factor))
-
-        # Map each image index → camera index (round-robin if images > cameras,
-        # e.g. 3 cameras means images 0,1,2 → cameras 0,1,2)
-        cam_indices: list = []
-        for img_idx, n_tok in enumerate(tokens_per_image):
-            cam_idx = img_idx % num_cameras
-            cam_indices.extend([cam_idx] * n_tok)
-
-        if not cam_indices:
-            return features
-
-        cam_ids = torch.tensor(cam_indices, device=features.device, dtype=torch.long)
-        cam_emb = self.camera_embeddings(cam_ids)  # [total_vision_tokens, D]
-
-        # Apply to each batch element at vision positions
         B = features.shape[0]
+        merge_factor = 4  # 2×2 spatial merge
+
+        # image_grid_thw may be:
+        #   [B, N_images, 3] — batched (from collate stacking per-sample [N_images, 3])
+        #   [total_images, 3] — flat (e.g. Qwen2-VL native format)
+        batched = image_grid_thw.ndim == 3
+
         out = features.clone()
         for b in range(B):
+            if batched:
+                grids_b = image_grid_thw[b]  # [N_images, 3]
+            else:
+                n_img = image_grid_thw.shape[0] // B
+                grids_b = image_grid_thw[b * n_img: (b + 1) * n_img]  # [n_img, 3]
+
+            cam_indices: list = []
+            for img_offset in range(grids_b.shape[0]):
+                t_val = grids_b[img_offset, 0].item()
+                h_val = grids_b[img_offset, 1].item()
+                w_val = grids_b[img_offset, 2].item()
+                n_tok = int(t_val * h_val * w_val // merge_factor)
+                cam_idx = img_offset % num_cameras
+                cam_indices.extend([cam_idx] * n_tok)
+
+            if not cam_indices:
+                continue
+
+            cam_ids = torch.tensor(cam_indices, device=features.device, dtype=torch.long)
+            cam_emb = self.camera_embeddings(cam_ids)  # [n_vision_tokens_b, D]
+
             vis_idx = vision_mask[b].nonzero(as_tuple=True)[0]
             n_vis = vis_idx.shape[0]
             n_emb = cam_emb.shape[0]

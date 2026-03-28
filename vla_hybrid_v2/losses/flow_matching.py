@@ -13,7 +13,9 @@ class FlowMatchingLoss(nn.Module):
         self.reduction = reduction
         self.timestep_schedule = timestep_schedule
 
-    def forward(self, velocity_pred, x_0, x_1, t, step_weights=None):
+    def forward(self, velocity_pred, x_0, x_1, t=None, step_weights=None):
+        # NOTE: `t` is accepted for API compatibility but unused —
+        # under Rectified Flow the target velocity (x_1 - x_0) is t-independent.
         target_velocity = x_1 - x_0
         loss = (velocity_pred - target_velocity).pow(2)
         if step_weights is not None:
