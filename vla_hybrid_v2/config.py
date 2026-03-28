@@ -265,13 +265,14 @@ class TrainConfig:
 @dataclass
 class RTCInferConfig:
     enable: bool = True
+    overlap_ratio: float = 0.333
     freeze_prefix_steps: int = 4
     inpaint_overlap: bool = True
 
 
 @dataclass
 class FASTERInferConfig:
-    enable: bool = True
+    enable: bool = False
     near_ratio: float = 0.3
     near_steps: int = 1
     far_steps: int = 4

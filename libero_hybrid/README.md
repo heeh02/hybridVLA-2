@@ -113,5 +113,6 @@ python -m libero_hybrid.scripts.train_libero \
 - The training wrapper uses `libero_hdf5`, not the generic flat `hdf5` loader.
 - `phase` and `affordance` losses are disabled in the baseline configs until
   real labels or a weak-labeling pipeline are added.
-- Stage C is configured as an honest low-LR joint fine-tune. RTC/FASTER are
-  intentionally disabled here until the implementation is real.
+- Stage C is configured as an honest low-LR joint fine-tune. RTC/FASTER losses
+  are wired in training; rollout now uses explicit normalizer-backed policy
+  transforms so evaluation matches training space more closely.

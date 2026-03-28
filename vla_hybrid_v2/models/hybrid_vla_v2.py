@@ -687,6 +687,13 @@ class HybridVLAv2(nn.Module):
         exec_horizon = self.cfg.infer.execution_horizon
 
         with torch.no_grad():
+            if self.cfg.infer.faster.enable:
+                raise NotImplementedError(
+                    "cfg.infer.faster.enable=True but FASTER inference is not "
+                    "implemented yet. Disable infer.faster or implement a "
+                    "matching inference schedule first."
+                )
+
             # ---- Check if cached chunk is still valid ----
             # v0.9.1: use monotonic counter instead of fragile id() (Issue A2)
             semantic_refresh = (runtime_state.refresh_counter != runtime_state._last_seen_refresh)
@@ -775,6 +782,7 @@ class HybridVLAv2(nn.Module):
                 # Save current chunk tail for next RTC blending
                 if rtc_cfg.enable:
                     rtc_overlap = max(1, int(rtc_cfg.overlap_ratio * exec_horizon))
+                    rtc_overlap = min(rtc_overlap, exec_horizon, denoised.shape[1])
                     runtime_state.prev_chunk_tail = denoised[
                         :, exec_horizon - rtc_overlap: exec_horizon
                     ].clone()

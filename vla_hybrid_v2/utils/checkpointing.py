@@ -43,6 +43,7 @@ def save_checkpoint(
     scheduler: Optional[Any] = None,
     ema: Optional[Any] = None,
     extra: Optional[Dict[str, Any]] = None,
+    asset_paths: Optional[Dict[str, str | Path]] = None,
 ) -> Optional[Path]:
     """Save training checkpoint (rank 0 only)."""
     output_dir = Path(output_dir)
@@ -68,6 +69,22 @@ def save_checkpoint(
         meta = {"step": step, "epoch": epoch, **(extra or {})}
         with open(tmp_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
+
+        if asset_paths:
+            assets_dir = tmp_dir / "assets"
+            assets_dir.mkdir(exist_ok=True)
+            for name, src in asset_paths.items():
+                src_path = Path(src)
+                if not src_path.exists():
+                    raise FileNotFoundError(
+                        f"Checkpoint asset '{name}' does not exist: {src_path}"
+                    )
+                dst = assets_dir / name
+                if src_path.is_dir():
+                    shutil.copytree(src_path, dst)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_path, dst)
 
         if ckpt_dir.exists():
             shutil.rmtree(ckpt_dir)

@@ -116,6 +116,7 @@ def wrap_fsdp(
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
         sync_module_states=sync_module_states,
+        use_orig_params=True,
         limit_all_gathers=True,
     )
 

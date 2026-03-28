@@ -8,19 +8,47 @@ Usage:
     ema.apply(model)        # swap in EMA weights for eval
     evaluate(model)
     ema.restore(model)      # swap back
+
+FSDP compatibility:
+    Initialise EMA *before* FSDP wrapping so shadows hold full (unsharded)
+    parameters.  update / apply / restore use ``summon_full_params`` when
+    the model is FSDP-wrapped.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Dict
 
 import torch
 from torch import Tensor, nn
 
 
+def _is_fsdp(model: nn.Module) -> bool:
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        return isinstance(model, FSDP)
+    except ImportError:
+        return False
+
+
+@contextmanager
+def _maybe_summon_full_params(model: nn.Module, writeback: bool = False):
+    """Summon full params for FSDP models; no-op otherwise."""
+    if _is_fsdp(model):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        with FSDP.summon_full_params(model, writeback=writeback, rank0_only=False):
+            yield
+    else:
+        yield
+
+
 class EMAModel:
     """EMA with linear decay ramp: decay(step) interpolates from
     initial_decay to final_decay over ramp_steps.
+
+    Must be initialised *before* FSDP wrapping so that shadow stores
+    full (unsharded) parameter tensors with their original names.
     """
 
     def __init__(
@@ -50,21 +78,25 @@ class EMAModel:
     @torch.no_grad()
     def update(self, model: nn.Module, step: int) -> None:
         decay = self._get_decay(step)
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.shadow[name].lerp_(param.data, 1.0 - decay)
+        with _maybe_summon_full_params(model, writeback=False):
+            for name, param in model.named_parameters():
+                if param.requires_grad and name in self.shadow:
+                    self.shadow[name].lerp_(param.data, 1.0 - decay)
 
     def apply(self, model: nn.Module) -> None:
         """Replace model params with EMA weights. Call restore() to undo."""
-        for name, param in model.named_parameters():
-            if name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
+        with _maybe_summon_full_params(model, writeback=True):
+            for name, param in model.named_parameters():
+                if name in self.shadow:
+                    self.backup[name] = param.data.clone()
+                    param.data.copy_(self.shadow[name])
 
     def restore(self, model: nn.Module) -> None:
-        for name, param in model.named_parameters():
-            if name in self.backup:
-                param.data.copy_(self.backup[name])
+        """Restore original weights saved by apply()."""
+        with _maybe_summon_full_params(model, writeback=True):
+            for name, param in model.named_parameters():
+                if name in self.backup:
+                    param.data.copy_(self.backup[name])
         self.backup.clear()
 
     def state_dict(self) -> dict:

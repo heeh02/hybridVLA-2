@@ -297,11 +297,13 @@ hybridVLA_2/
       normalizer.py            # Per-field running statistics
       collate.py               # Vision-aware batch collation with variable patch padding
       dummy.py                 # Synthetic data for smoke tests
-    infer/                     # Runtime inference loop (WIP)
+    infer/
+      __init__.py              # Public API: HybridVLALiberoPolicy, resolve_policy_config, etc.
+      libero_policy.py         # Unified LIBERO inference policy (normalize/denormalize, EMA loading)
     utils/
-      checkpointing.py         # Save/load with stage awareness
-      distributed.py           # FSDP helpers
-      ema.py                   # Exponential moving average with decay ramp
+      checkpointing.py         # Save/load with asset packaging (config + normalizer stats)
+      distributed.py           # FSDP helpers (use_orig_params=True)
+      ema.py                   # EMA with FSDP summon_full_params support
   libero_hybrid/               # LIBERO benchmark integration
     scripts/
       train_libero.py          # LIBERO training wrapper with variant switching
@@ -309,8 +311,8 @@ hybridVLA_2/
       compute_libero_stats.py  # Normalization statistics for LIBERO
       validate_libero_hdf5.py  # HDF5 structural validation
     utils.py                   # Suite path resolution, demo sorting
-  tests/                       # 28 unit tests (three-stage, ODE, normalizer, losses)
-  docs/                        # Design documents and iteration history (v0.1 - v0.10.7)
+  tests/                       # Unit tests (three-stage, ODE, normalizer, losses, control_step, checkpoint, infer)
+  docs/                        # Design documents and iteration history (v0.10+ ; pre-v0.10 archived)
   pyproject.toml               # Project packaging (Python ≥3.10, ruff, pytest)
 ```
 
@@ -321,19 +323,24 @@ hybridVLA_2/
 
 ## Status
 
-The architecture (v0.10.7, score 8.3/10) has been through 15+ iterations of cross-audits and is considered **LIBERO benchmark closed-loop ready**. The codebase has grown from ~5,250 to ~9,870 lines with complete data → train → evaluate pipelines.
+The architecture (v0.10.9, score 8.7/10) has been through 20+ iterations of cross-audits and is **multi-GPU training ready** with a complete data → train → evaluate pipeline.
+
+**v0.10.8** added a unified inference policy (`HybridVLALiberoPolicy`) that handles action/proprio normalization alignment between training and inference, self-contained checkpoint asset packaging (config + normalizer stats bundled into each checkpoint), and EMA weight loading at inference time.
+
+**v0.10.9** fixed critical multi-GPU issues: FSDP evaluate() deadlock (all ranks now participate with `dist.all_reduce`), EMA/FSDP parameter name mismatch (EMA initialized before FSDP wrapping, uses `summon_full_params` for apply/restore), validation using EMA weights, per-module gradient norm logging timing, and action clipping at inference boundaries.
 
 **Ready**:
-- Three-stage training on 8xH100 (Stage A/B/C)
-- LIBERO benchmark training and closed-loop evaluation
-- 28 unit tests covering three-stage loss, ODE solvers, normalizer, all losses
+- Three-stage training on 8xH100 (Stage A/B/C), multi-GPU FSDP verified
+- LIBERO benchmark training and closed-loop evaluation with proper normalization
+- Unified inference policy with EMA weight loading and checkpoint asset discovery
+- Self-contained checkpoints (model + optimizer + EMA + config + normalizer stats)
+- Unit tests covering three-stage loss, ODE solvers, normalizer, control_step, checkpoint assets, inference policy
 
 **In progress**:
 - Actual training runs and hyperparameter tuning
 - Multi-camera evaluation on LIBERO
 - World model training loop integration
-- RTC/FASTER loss implementation in `forward_train()` (Stage C config exists but logic not yet wired)
-- Generic `infer/` PolicyWrapper (LIBERO has dedicated `eval_libero_rollout.py`)
+- FASTER inference schedule (currently raises `NotImplementedError` when explicitly enabled)
 
 ## Collaboration
 
@@ -549,6 +556,17 @@ v0.10.7 新增完整的 **数据 → 训练 → 评估** 管线：
 - **控制循环（50 Hz）**：运行时序核心（快速流每步、中速流每 2 步、慢速流复用缓存 token）并通过 Flow 专家生成动作块。
 
 **动作块缓存**：一个 24 步的动作块生成一次，执行 8 步（执行视野）。仅在缓存耗尽、语义刷新发生或缓存未初始化时才生成新块，避免稳态执行中的冗余专家前向传播。
+
+**统一推理策略**（v0.10.8）：`HybridVLALiberoPolicy` 处理训练-推理归一化对齐（本体感受归一化后输入 `control_step()`，模型空间动作反归一化后发送至环境）、EMA 权重加载、以及从检查点资产自动发现配置和归一化统计。
+
+**自包含检查点**（v0.10.8）：每个检查点打包完整的推理资产：
+```
+checkpoint-STEP/
+  model.pt, optimizer.pt, scheduler.pt, ema.pt, meta.json
+  assets/
+    resolved_config.yaml
+    normalizer_stats/{action_stats.json, proprio_stats.json}
+```
 
 ## 参数预算
 

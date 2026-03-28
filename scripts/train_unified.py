@@ -23,12 +23,15 @@ import logging
 import math
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+import yaml
 
 from vla_hybrid_v2.config import HybridVLAv2Config, load_config
 from vla_hybrid_v2.data import build_dataset
@@ -78,6 +81,34 @@ def setup_logging(log_dir: Optional[str] = None) -> None:
         format=f"%(asctime)s [R{get_rank()}] %(name)s: %(message)s",
         datefmt="%H:%M:%S", handlers=handlers, force=True,
     )
+
+
+def _save_resolved_config(cfg: HybridVLAv2Config) -> Path:
+    """Persist the effective config next to checkpoints for reproducible inference."""
+    output_dir = Path(cfg.train.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dst = output_dir / "resolved_config.yaml"
+    if is_main_process():
+        with open(dst, "w") as f:
+            yaml.safe_dump(asdict(cfg), f, sort_keys=False)
+    return dst
+
+
+def _checkpoint_assets(cfg: HybridVLAv2Config, resolved_config_path: Path) -> Dict[str, Path]:
+    """Collect small inference-time assets that should travel with checkpoints."""
+    assets: Dict[str, Path] = {}
+    if resolved_config_path.exists():
+        assets["resolved_config.yaml"] = resolved_config_path
+
+    stats_dir: Optional[Path] = None
+    if cfg.data.format in ("hdf5", "libero_hdf5"):
+        if cfg.data.normalizer_stats_dir:
+            stats_dir = Path(cfg.data.normalizer_stats_dir)
+        else:
+            stats_dir = Path(cfg.train.output_dir) / "normalizer_stats"
+    if stats_dir is not None and stats_dir.exists():
+        assets["normalizer_stats"] = stats_dir
+    return assets
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +347,8 @@ def train(cfg: HybridVLAv2Config) -> None:
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     setup_logging(cfg.train.output_dir)
     stage = cfg.stage
+    resolved_config_path = _save_resolved_config(cfg)
+    checkpoint_assets = _checkpoint_assets(cfg, resolved_config_path)
 
     logger.info("Unified training — Stage %s | v2 Tri-Rate + Hierarchical Grounder", stage.upper())
     logger.info("World size: %d, local rank: %d, device: %s",
@@ -335,6 +368,19 @@ def train(cfg: HybridVLAv2Config) -> None:
                 f"{trainable:,}", f"{total:,}", 100.0 * trainable / max(total, 1))
 
     model = model.to(device)
+
+    # ---- EMA (before FSDP so shadows hold full unsharded params) ----
+    ema = None
+    if cfg.model.ema.enable:
+        from vla_hybrid_v2.utils.ema import EMAModel
+        ema = EMAModel(
+            model, initial_decay=cfg.model.ema.initial_decay,
+            final_decay=cfg.model.ema.final_decay,
+            ramp_steps=cfg.model.ema.ramp_steps,
+        )
+        logger.info("EMA enabled (decay %.4f → %.4f over %d steps)",
+                     cfg.model.ema.initial_decay, cfg.model.ema.final_decay,
+                     cfg.model.ema.ramp_steps)
 
     # ---- FSDP ----
     if cfg.train.fsdp and get_world_size() > 1:
@@ -380,19 +426,6 @@ def train(cfg: HybridVLAv2Config) -> None:
         optimizer, warmup_steps=cfg.train.warmup_steps,
         total_steps=cfg.train.max_steps,
     )
-
-    # ---- EMA (typically enabled from Stage B) ----
-    ema = None
-    if cfg.model.ema.enable:
-        from vla_hybrid_v2.utils.ema import EMAModel
-        ema = EMAModel(
-            model, initial_decay=cfg.model.ema.initial_decay,
-            final_decay=cfg.model.ema.final_decay,
-            ramp_steps=cfg.model.ema.ramp_steps,
-        )
-        logger.info("EMA enabled (decay %.4f → %.4f over %d steps)",
-                     cfg.model.ema.initial_decay, cfg.model.ema.final_decay,
-                     cfg.model.ema.ramp_steps)
 
     # ---- Cross-stage checkpoint loading ----
     if cfg.train.resume_from:
@@ -441,9 +474,13 @@ def train(cfg: HybridVLAv2Config) -> None:
     try:
         val_dataset, val_collate_fn = build_dataset(cfg, split="val", processor=processor)
         if len(val_dataset) > 0:
+            val_sampler = (
+                torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
+                if get_world_size() > 1 else None
+            )
             val_loader = DataLoader(
                 val_dataset, batch_size=cfg.train.per_device_batch_size,
-                shuffle=False, num_workers=1, pin_memory=True,
+                sampler=val_sampler, shuffle=False, num_workers=1, pin_memory=True,
                 drop_last=False, collate_fn=val_collate_fn,
             )
             logger.info("Val dataset: %s (%d samples)", type(val_dataset).__name__, len(val_dataset))
@@ -486,6 +523,10 @@ def train(cfg: HybridVLAv2Config) -> None:
 
             if (batch_idx + 1) % grad_accum == 0:
                 grad_norm = clip_grad_norm_fsdp(model, cfg.train.max_grad_norm)
+                # V5: per-module gradient norm — must run before zero_grad
+                next_step = global_step + 1
+                if is_main_process() and next_step % (cfg.train.log_interval * 5) == 0:
+                    _log_per_module_grad_norm(model)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -505,33 +546,41 @@ def train(cfg: HybridVLAv2Config) -> None:
                     parts = " | ".join(f"{k}: {v:.4f}" for k, v in avg.items())
                     logger.info("Step %d | %s | gnorm: %.3f | lr: %.2e | %.1f sps",
                                 global_step, parts, grad_norm.item(), lr, sps)
-                    # V5: per-module gradient norm (every 5× log_interval to limit overhead)
-                    if global_step % (cfg.train.log_interval * 5) == 0:
-                        _log_per_module_grad_norm(model)
                     accum_loss.clear()
                     step_start = time.monotonic()
 
-                # Eval (v0.10.3 P1-E)
+                # Eval — all ranks participate to avoid FSDP deadlock
                 if (val_loader is not None
-                        and global_step % cfg.train.eval_interval == 0
-                        and is_main_process()):
+                        and global_step % cfg.train.eval_interval == 0):
+                    if ema is not None:
+                        ema.apply(model)
                     metrics = evaluate(model, val_loader, device, cfg)
-                    parts = " | ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
-                    logger.info("Eval step %d | %s", global_step, parts)
+                    if ema is not None:
+                        ema.restore(model)
+                    if dist.is_initialized() and get_world_size() > 1:
+                        for k in list(metrics.keys()):
+                            t = torch.tensor(metrics[k], device=device)
+                            dist.all_reduce(t, op=dist.ReduceOp.AVG)
+                            metrics[k] = t.item()
+                    if is_main_process():
+                        parts = " | ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
+                        logger.info("Eval step %d | %s", global_step, parts)
 
                 # Checkpoint
                 if global_step % cfg.train.save_interval == 0:
                     save_checkpoint(model, optimizer, global_step,
                                     cfg.train.output_dir, epoch=epoch,
                                     scheduler=scheduler, ema=ema,
-                                    extra={"stage": stage})
+                                    extra={"stage": stage},
+                                    asset_paths=checkpoint_assets)
 
         if global_step >= cfg.train.max_steps:
             break
 
     save_checkpoint(model, optimizer, global_step, cfg.train.output_dir,
                     epoch=epoch, scheduler=scheduler, ema=ema,
-                    extra={"stage": stage, "final": True})
+                    extra={"stage": stage, "final": True},
+                    asset_paths=checkpoint_assets)
     logger.info("Stage %s complete at step %d.", stage.upper(), global_step)
     cleanup_distributed()
 

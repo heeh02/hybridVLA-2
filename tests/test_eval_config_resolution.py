@@ -86,6 +86,18 @@ def multicam_stage_dir(tmp_path):
 class TestFindResolvedConfig:
     """Test _find_resolved_config discovery logic."""
 
+    def test_prefers_checkpoint_local_asset_copy(self, tmp_path):
+        from libero_hybrid.scripts.eval_libero_rollout import _find_resolved_config
+
+        ckpt = tmp_path / "stage_c" / "checkpoint-5000"
+        ckpt_assets = ckpt / "assets"
+        ckpt_assets.mkdir(parents=True)
+        asset_cfg = ckpt_assets / "resolved_config.yaml"
+        _write_yaml(asset_cfg, _minimal_config(multi_camera_enable=False))
+
+        result = _find_resolved_config(str(ckpt))
+        assert result == asset_cfg
+
     def test_finds_from_checkpoint_dir(self, stage_dir):
         from libero_hybrid.scripts.eval_libero_rollout import _find_resolved_config
 
