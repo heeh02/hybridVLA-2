@@ -36,12 +36,13 @@ class TestControlStep:
         assert runtime.prev_chunk_tail is not None
 
     def test_faster_infer_fails_fast_until_implemented(self):
+        """L-6: FASTER is train-only — inference must fail fast with clear error."""
         cfg = _mini_cfg("b")
         cfg.infer.faster.enable = True
         model = _build_model(cfg)
         runtime = model.init_runtime(batch_size=1, device="cpu")
 
-        with pytest.raises(NotImplementedError, match="FASTER inference"):
+        with pytest.raises(NotImplementedError, match="FASTER"):
             model.control_step(
                 proprio=torch.randn(1, P),
                 prev_action=torch.zeros(1, A),

@@ -73,7 +73,7 @@ class TestConsistencyLoss:
         d = torch.randn(B, H, A)
         c = torch.randn(B, H, A)
         loss = loss_fn(d, c)
-        assert 0.0 <= loss.item() <= 2.0  # cosine sim range
+        assert loss.item() >= 0.0  # MSE is non-negative
 
     def test_combined_loss(self):
         from vla_hybrid_v2.losses.consistency_loss import V2ConsistencyLoss
