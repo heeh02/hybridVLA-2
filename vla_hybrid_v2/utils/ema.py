@@ -24,6 +24,16 @@ import torch
 from torch import Tensor, nn
 
 
+_FSDP_PREFIX = "_fsdp_wrapped_module."
+
+
+def _strip_fsdp_prefix(name: str) -> str:
+    """Strip all FSDP wrapper prefixes from a parameter name."""
+    while _FSDP_PREFIX in name:
+        name = name.replace(_FSDP_PREFIX, "")
+    return name
+
+
 def _is_fsdp(model: nn.Module) -> bool:
     try:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -80,23 +90,26 @@ class EMAModel:
         decay = self._get_decay(step)
         with _maybe_summon_full_params(model, writeback=False):
             for name, param in model.named_parameters():
-                if param.requires_grad and name in self.shadow:
-                    self.shadow[name].lerp_(param.data, 1.0 - decay)
+                clean = _strip_fsdp_prefix(name)
+                if param.requires_grad and clean in self.shadow:
+                    self.shadow[clean].lerp_(param.data, 1.0 - decay)
 
     def apply(self, model: nn.Module) -> None:
         """Replace model params with EMA weights. Call restore() to undo."""
         with _maybe_summon_full_params(model, writeback=True):
             for name, param in model.named_parameters():
-                if name in self.shadow:
-                    self.backup[name] = param.data.clone()
-                    param.data.copy_(self.shadow[name])
+                clean = _strip_fsdp_prefix(name)
+                if clean in self.shadow:
+                    self.backup[clean] = param.data.clone()
+                    param.data.copy_(self.shadow[clean])
 
     def restore(self, model: nn.Module) -> None:
         """Restore original weights saved by apply()."""
         with _maybe_summon_full_params(model, writeback=True):
             for name, param in model.named_parameters():
-                if name in self.backup:
-                    param.data.copy_(self.backup[name])
+                clean = _strip_fsdp_prefix(name)
+                if clean in self.backup:
+                    param.data.copy_(self.backup[clean])
         self.backup.clear()
 
     def state_dict(self) -> dict:
@@ -108,7 +121,27 @@ class EMAModel:
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self.shadow = state["shadow"]
+        loaded_shadow = state["shadow"]
+        # Filter out shape-mismatched keys (e.g. ActionHistoryEncoder resized
+        # in v0.10.10).  Mismatched shadows are dropped and will be
+        # re-initialised from the current model params at the next update().
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
+        dropped = []
+        for k in list(loaded_shadow.keys()):
+            if k in self.shadow and loaded_shadow[k].shape != self.shadow[k].shape:
+                dropped.append(
+                    f"  {k}: ckpt {list(loaded_shadow[k].shape)} vs "
+                    f"model {list(self.shadow[k].shape)}"
+                )
+                del loaded_shadow[k]
+        if dropped:
+            _logger.warning(
+                "EMA: dropped %d shadow keys with shape mismatch "
+                "(pre-v0.10.10 checkpoint):\n%s",
+                len(dropped), "\n".join(dropped[:10]),
+            )
+        self.shadow.update(loaded_shadow)
         self.initial_decay = state.get("initial_decay", self.initial_decay)
         self.final_decay = state.get("final_decay", self.final_decay)
         self.ramp_steps = state.get("ramp_steps", self.ramp_steps)

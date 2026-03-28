@@ -123,6 +123,24 @@ def load_checkpoint(
 
     state = torch.load(ckpt_dir / "model.pt", map_location=map_location, weights_only=True)
 
+    # v0.10.10: filter out keys whose shapes don't match the current model
+    # (e.g. ActionHistoryEncoder was resized from d=2048 to d=256).
+    # This prevents RuntimeError on shape mismatch when strict=False.
+    model_state = model.state_dict() if not hasattr(model, 'module') else model.module.state_dict()
+    shape_mismatched = []
+    for k in list(state.keys()):
+        if k in model_state and state[k].shape != model_state[k].shape:
+            shape_mismatched.append(
+                f"  {k}: ckpt {list(state[k].shape)} vs model {list(model_state[k].shape)}"
+            )
+            del state[k]
+    if shape_mismatched:
+        logger.warning(
+            "Dropped %d keys with shape mismatch (likely pre-v0.10.10 "
+            "checkpoint — ActionHistoryEncoder was resized):\n%s",
+            len(shape_mismatched), "\n".join(shape_mismatched[:10]),
+        )
+
     # N1 fix: FSDP models need state_dict_type context to correctly load
     # a FULL_STATE_DICT checkpoint.  Without this, FSDP's default LOCAL
     # state_dict type causes key mismatch and silent param loss.

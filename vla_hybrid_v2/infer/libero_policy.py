@@ -109,14 +109,16 @@ def _candidate_stats_dirs(
     ckpt = resolve_checkpoint_dir(checkpoint_path)
     candidates: List[Path] = []
 
-    if cfg.data.normalizer_stats_dir:
-        candidates.append(Path(cfg.data.normalizer_stats_dir).expanduser())
-
+    # Checkpoint-local assets first (most reproducible — travels with checkpoint)
     candidates.extend([
         ckpt / "assets" / "normalizer_stats",
         ckpt.parent / "normalizer_stats",
         ckpt.parent.parent / "normalizer_stats",
     ])
+
+    # Config-specified path as fallback
+    if cfg.data.normalizer_stats_dir:
+        candidates.append(Path(cfg.data.normalizer_stats_dir).expanduser())
 
     resolved_cfg = find_resolved_config(checkpoint_path)
     if resolved_cfg is not None:

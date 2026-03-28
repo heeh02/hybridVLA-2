@@ -369,7 +369,22 @@ def train(cfg: HybridVLAv2Config) -> None:
 
     model = model.to(device)
 
-    # ---- EMA (before FSDP so shadows hold full unsharded params) ----
+    # ---- Cross-stage checkpoint loading (before EMA so shadow clones resumed weights) ----
+    if cfg.train.resume_from:
+        from vla_hybrid_v2.utils.checkpointing import load_checkpoint as _load_ckpt
+        _resume_path = Path(cfg.train.resume_from)
+        if _resume_path.is_symlink():
+            _resume_path = _resume_path.resolve()
+        if not (_resume_path / "model.pt").exists():
+            raise FileNotFoundError(
+                f"Cross-stage checkpoint not found: {cfg.train.resume_from}\n"
+                f"Resolved path: {_resume_path}\n"
+                f"Ensure the prior stage completed and saved a checkpoint."
+            )
+        logger.info("Loading cross-stage checkpoint: %s", _resume_path)
+        _load_ckpt(_resume_path, model, strict=False)
+
+    # ---- EMA (after cross-stage resume, before FSDP so shadows hold full unsharded params) ----
     ema = None
     if cfg.model.ema.enable:
         from vla_hybrid_v2.utils.ema import EMAModel
@@ -388,6 +403,8 @@ def train(cfg: HybridVLAv2Config) -> None:
                           use_activation_checkpointing=cfg.train.checkpointing)
 
     # ---- Optimizer: per-module LR + weight decay groups (V4) ----
+    from vla_hybrid_v2.utils.ema import _strip_fsdp_prefix
+
     base_lr = cfg.train.learning_rate
     no_decay_keywords = {"bias", "res_scale", "LayerNorm.weight", "layer_norm.weight"}
 
@@ -396,17 +413,19 @@ def train(cfg: HybridVLAv2Config) -> None:
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        # Strip FSDP prefix so startswith checks work on multi-GPU
+        clean = _strip_fsdp_prefix(name)
         # Determine module group and LR scale
-        if name.startswith("backbone"):
+        if clean.startswith("backbone"):
             group = "backbone"
             lr_scale = cfg.train.backbone_lr_scale
-        elif name.startswith("action_expert"):
+        elif clean.startswith("action_expert"):
             group = "expert"
             lr_scale = cfg.train.expert_lr_scale
         else:
             group = "core"
             lr_scale = 1.0
-        is_no_decay = any(nd in name for nd in no_decay_keywords)
+        is_no_decay = any(nd in clean for nd in no_decay_keywords)
         key = f"{group}_{'nodecay' if is_no_decay else 'decay'}"
         if key not in param_groups_map:
             param_groups_map[key] = {"params": [], "lr": base_lr * lr_scale,
@@ -426,21 +445,6 @@ def train(cfg: HybridVLAv2Config) -> None:
         optimizer, warmup_steps=cfg.train.warmup_steps,
         total_steps=cfg.train.max_steps,
     )
-
-    # ---- Cross-stage checkpoint loading ----
-    if cfg.train.resume_from:
-        from vla_hybrid_v2.utils.checkpointing import load_checkpoint
-        _resume_path = Path(cfg.train.resume_from)
-        if _resume_path.is_symlink():
-            _resume_path = _resume_path.resolve()
-        if not (_resume_path / "model.pt").exists():
-            raise FileNotFoundError(
-                f"Cross-stage checkpoint not found: {cfg.train.resume_from}\n"
-                f"Resolved path: {_resume_path}\n"
-                f"Ensure the prior stage completed and saved a checkpoint."
-            )
-        logger.info("Loading cross-stage checkpoint: %s", _resume_path)
-        load_checkpoint(_resume_path, model, strict=False)
 
     # ---- Auto-resume (same-stage) ----
     start_step, start_epoch = auto_resume(
@@ -549,14 +553,24 @@ def train(cfg: HybridVLAv2Config) -> None:
                     accum_loss.clear()
                     step_start = time.monotonic()
 
-                # Eval — all ranks participate to avoid FSDP deadlock
+                # Eval — all ranks participate to avoid FSDP deadlock.
+                # Barrier placement:
+                #   barrier AFTER apply  → all ranks have EMA weights before eval
+                #   barrier BEFORE restore → all ranks finished eval before restoring
+                #   barrier AFTER restore  → all ranks have training weights before next step
                 if (val_loader is not None
                         and global_step % cfg.train.eval_interval == 0):
                     if ema is not None:
                         ema.apply(model)
+                        if dist.is_initialized():
+                            dist.barrier()
                     metrics = evaluate(model, val_loader, device, cfg)
                     if ema is not None:
+                        if dist.is_initialized():
+                            dist.barrier()
                         ema.restore(model)
+                        if dist.is_initialized():
+                            dist.barrier()
                     if dist.is_initialized() and get_world_size() > 1:
                         for k in list(metrics.keys()):
                             t = torch.tensor(metrics[k], device=device)
