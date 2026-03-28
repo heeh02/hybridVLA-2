@@ -14,8 +14,9 @@
 5. [CHANGELOG 变更日志](#5-changelog-变更日志)
 6. [GitHub Actions CI 持续集成](#6-github-actions-ci-持续集成)
 7. [日常开发工作流（完整示例）](#7-日常开发工作流完整示例)
-8. [常用 Git 命令速查](#8-常用-git-命令速查)
-9. [出问题了怎么办](#9-出问题了怎么办)
+8. [Claude Code + Git 完整工作流](#8-claude-code--git-完整工作流)
+9. [常用 Git 命令速查](#9-常用-git-命令速查)
+10. [出问题了怎么办](#10-出问题了怎么办)
 
 ---
 
@@ -436,7 +437,369 @@ main ─────────────────────────
 
 ---
 
-## 8. 常用 Git 命令速查
+## 8. Claude Code + Git 完整工作流
+
+> 本节是本文档的核心。介绍如何把 Claude Code 的 AI 编程和审查能力
+> 与 Git 的版本控制结合起来，形成一套**审计 → 修复 → 测试 → 审查**的闭环，
+> 每一步都有安全网，随时可以回退。
+
+### 8.1 整体流程概览
+
+```
+                          你的开发循环
+                    ┌──────────────────────┐
+                    │                      │
+                    ▼                      │
+  ┌─────────────────────────────┐          │
+  │ 阶段 1：审计 (Audit)         │          │
+  │ Claude Code 会话 A           │          │
+  │ 全面检查代码，输出问题清单    │          │
+  │ 📄 生成 audit_report.md     │          │
+  └────────────┬────────────────┘          │
+               │                           │
+               ▼                           │
+  ┌─────────────────────────────┐          │
+  │ 阶段 2：修复 (Fix)           │          │
+  │ Claude Code 会话 B           │          │
+  │ 在 feature 分支上修代码      │          │
+  │ 跑测试，确认修复             │          │
+  │ 🔀 git commit 保存每步修复  │          │
+  └────────────┬────────────────┘          │
+               │                           │
+               ▼                           │
+  ┌─────────────────────────────┐          │
+  │ 阶段 3：审查 (Review)        │          │
+  │ Claude Code 会话 C           │          │
+  │ 对比 diff，检查修复质量      │          │
+  │ 通过 → 合并；不通过 → 返回 │──────────┘
+  └────────────┬────────────────┘
+               │ 通过
+               ▼
+  ┌─────────────────────────────┐
+  │ 合并到 dev → 最终到 main    │
+  │ 打 tag，更新 CHANGELOG      │
+  └─────────────────────────────┘
+```
+
+### 8.2 为什么要分三个阶段？
+
+| 阶段 | 目的 | 类比 |
+|------|------|------|
+| 审计 | 发现问题，不动代码 | 医生检查，只看不治 |
+| 修复 | 根据审计结果改代码 | 做手术 |
+| 审查 | 确认手术成功，没有新问题 | 术后复查 |
+
+**分离审计和修复**的好处：
+- 审计时不会急着改代码，能更全面地发现问题
+- 修复时有明确的目标清单，不会遗漏
+- 审查时有清晰的对比基准
+
+### 8.3 阶段 1：代码审计（只读，不改代码）
+
+**目标**：让 Claude Code 全面检查代码，输出一份问题报告。
+
+#### 步骤
+
+```bash
+# 1. 确保你在 dev 分支上，代码是干净的
+git checkout dev
+git status                # 确认没有未提交的改动
+
+# 2. 启动 Claude Code
+claude
+```
+
+在 Claude Code 中，给一个**完整的审计指令**：
+
+```
+请对整个项目进行全面代码审计，重点检查：
+
+1. 是否有运行时会崩溃的 bug（import 错误、类型不匹配、shape 不对等）
+2. 损失函数的数学正确性
+3. FSDP/多 GPU 训练时的潜在问题
+4. 性能瓶颈（内存泄漏、不必要的 .detach() 缺失等）
+5. 配置项与实际代码的一致性
+
+请输出一份结构化的审计报告，按严重程度分级：
+- P0：运行时会崩溃
+- P1：结果会不正确
+- P2：性能问题
+- P3：代码质量建议
+
+把报告保存到 docs/audit_report_v1.1.md
+```
+
+#### 关键原则
+
+- **这个阶段不改任何代码**——只读、只分析
+- Claude Code 会阅读文件、运行测试、检查依赖
+- 输出的报告是下一阶段的工作清单
+- 报告本身也 commit 到仓库，作为记录
+
+```bash
+# 审计完成后，提交报告
+git add docs/audit_report_v1.1.md
+git commit -m "docs: add v1.1 code audit report"
+git push origin dev
+```
+
+### 8.4 阶段 2：代码修复（在 feature 分支上改代码）
+
+**目标**：根据审计报告逐项修复，每个修复都有独立的 commit，随时可回退。
+
+#### 步骤
+
+```bash
+# 1. 从 dev 创建修复分支——这是你的安全网！
+git checkout dev
+git checkout -b fix/audit-v1.1
+
+# 2. 启动新的 Claude Code 会话
+claude
+```
+
+给 Claude Code 修复指令：
+
+```
+请阅读 docs/audit_report_v1.1.md 中的审计报告，
+按优先级从高到低逐项修复。
+
+要求：
+- 每修复一个问题，立即 commit（不要攒一堆一起提交）
+- commit message 引用审计报告的问题编号，如 "fix: resolve P0-1 shape mismatch in flow matching"
+- 修完一个问题后，运行相关测试确认不会引入新 bug
+- 如果某个问题需要大改，先告诉我方案再动手
+```
+
+#### Git 在这里的保护作用
+
+```
+dev ──────●──────────────────────────── dev（安全，没动过）
+           ╲
+            ●─── fix/audit-v1.1
+            │
+            ●  commit: "fix: resolve P0-1 shape mismatch"
+            │
+            ●  commit: "fix: resolve P0-2 gradient not synced"
+            │
+            ●  commit: "fix: resolve P1-1 wrong loss reduction"
+            │
+            ●  commit: "test: add regression tests for P0/P1 fixes"
+```
+
+**每一步都可以回退**：
+
+```bash
+# 情况 A：某个修复引入了新问题，撤回最近一次 commit
+git reset --soft HEAD~1       # 撤回 commit，保留文件改动，重新修
+
+# 情况 B：整个修复方向错了，回到修复前的状态
+git checkout dev              # 切回 dev（安全，一切照旧）
+git branch -D fix/audit-v1.1  # 删掉错误的修复分支
+git checkout -b fix/audit-v1.1 # 重新开始
+
+# 情况 C：想看某个修复前后的对比
+git log --oneline             # 找到 commit ID
+git diff abc1234 def5678      # 对比两个 commit 的差异
+```
+
+#### 修复完成后
+
+```bash
+# 跑全部测试，确保没有 regression
+pytest
+
+# 如果通过，推送到 GitHub
+git push -u origin fix/audit-v1.1
+```
+
+### 8.5 阶段 3：代码审查（对比 diff，质量把关）
+
+**目标**：让 Claude Code 审查修复分支的所有改动，确认修复质量。
+
+#### 方式一：本地 Claude Code 审查（推荐）
+
+```bash
+# 启动新的 Claude Code 会话
+claude
+```
+
+给 Claude Code 审查指令：
+
+```
+请对 fix/audit-v1.1 分支的所有改动进行 code review。
+
+运行以下命令查看完整 diff：
+git diff dev...fix/audit-v1.1
+
+对照 docs/audit_report_v1.1.md 的问题清单，检查：
+1. 审计报告中的每个问题是否都已修复
+2. 修复是否引入了新的问题
+3. 测试覆盖是否充分
+4. 有无不必要的改动（只改该改的，不要多余的重构）
+
+请输出审查结论：
+- APPROVED：可以合并
+- CHANGES_REQUESTED：需要修改（列出具体问题）
+```
+
+#### 方式二：通过 GitHub PR 审查
+
+```bash
+# 1. 先创建 PR（如果还没有）
+gh pr create --base dev --head fix/audit-v1.1 \
+  --title "fix: resolve audit v1.1 issues" \
+  --body "Fixes issues from docs/audit_report_v1.1.md"
+
+# 2. 用 Claude Code 审查 PR
+claude --from-pr <PR编号>
+```
+
+然后在 Claude Code 中：
+```
+请审查这个 PR 的所有改动
+```
+
+#### 审查不通过怎么办？
+
+```bash
+# 回到修复分支，继续修
+git checkout fix/audit-v1.1
+
+# 启动 Claude Code，根据审查意见继续修复
+claude
+# "请根据刚才的 code review 意见，修复以下问题：..."
+
+# 修完后再次推送
+git push origin fix/audit-v1.1
+
+# 重新审查（回到阶段 3）
+```
+
+#### 审查通过，合并！
+
+```bash
+# 合并到 dev
+git checkout dev
+git merge fix/audit-v1.1
+git push origin dev
+
+# 清理修复分支
+git branch -d fix/audit-v1.1
+git push origin --delete fix/audit-v1.1
+```
+
+### 8.6 完整实战示例
+
+以下是一个完整的真实场景演示：
+
+```bash
+# ================================================================
+#  场景：v1.1 版本 — 修复审计发现的 Mamba 内存问题 + 损失函数 bug
+# ================================================================
+
+# ──── 阶段 1：审计 ────
+git checkout dev
+claude                           # 会话 A：审计
+# → Claude 输出 docs/audit_report_v1.1.md
+# → 发现 3 个 P0、2 个 P1、5 个 P2 问题
+git add docs/audit_report_v1.1.md
+git commit -m "docs: add v1.1 audit report (3 P0, 2 P1, 5 P2)"
+git push origin dev
+
+# ──── 阶段 2：修复 ────
+git checkout -b fix/audit-v1.1
+claude                           # 会话 B：修复
+# → Claude 逐个修复，每个一个 commit
+# → 跑 pytest，全部通过
+git push -u origin fix/audit-v1.1
+
+# ──── 阶段 3：审查 ────
+claude                           # 会话 C：审查
+# → "请审查 git diff dev...fix/audit-v1.1 的所有改动"
+# → Claude 审查后输出 APPROVED
+
+# ──── 合并发布 ────
+git checkout dev
+git merge fix/audit-v1.1
+git branch -d fix/audit-v1.1
+git push origin dev
+
+# 如果要发布到 main
+git checkout main
+git merge dev
+# 更新 CHANGELOG.md
+git add CHANGELOG.md
+git commit -m "docs: update CHANGELOG for v1.1.0"
+git tag -a v1.1.0 -m "v1.1.0: fix Mamba memory + loss function bugs"
+git push origin main --tags
+
+git checkout dev
+git merge main
+git push origin dev
+```
+
+### 8.7 Claude Code 实用命令速查
+
+在 Claude Code 交互界面中，以下命令和技巧很实用：
+
+| 命令 / 操作 | 用途 | 什么时候用 |
+|-------------|------|-----------|
+| `claude` | 启动新会话 | 每个阶段开始时 |
+| `claude --worktree fix-name` | 在隔离的工作树中启动 | 想同时跑审计和修另一个 bug 时 |
+| `claude --from-pr 123` | 从 PR 恢复会话 | 审查 GitHub PR 时 |
+| `/review` | 触发代码审查 | 阶段 3 审查时 |
+| `/simplify` | 检查代码质量并优化 | 修复完成后精简代码 |
+| `Esc + Esc` | 回退到上一步 | Claude 改错了，想撤回 |
+| `/clear` | 清除当前会话上下文 | 切换阶段时 |
+
+### 8.8 Worktree：并行处理多个任务
+
+当你想**同时进行审计和修复**（比如审计到一半发现一个紧急 bug 要立刻修），
+可以用 Claude Code 的 worktree 功能：
+
+```bash
+# 终端 1：正在审计
+claude
+
+# 终端 2：同时开一个隔离环境修紧急 bug
+claude --worktree fix-urgent-bug
+# → 自动创建 .claude/worktrees/fix-urgent-bug/
+# → 自动创建分支 worktree-fix-urgent-bug
+# → 在隔离的代码副本中修改，不影响终端 1 的审计
+```
+
+**Worktree 的好处**：
+- 每个 worktree 是一份独立的代码副本
+- 改动完全隔离，互不干扰
+- 修完后合并回主分支即可
+- Claude Code 会自动管理创建和清理
+
+### 8.9 回退策略总结
+
+不同阶段出问题时的回退方法：
+
+| 场景 | 回退操作 | 数据丢失？ |
+|------|---------|-----------|
+| 审计报告写错了 | 修改文件重新 commit | 否 |
+| 某个修复有问题 | `git reset --soft HEAD~1`，重新修 | 否（代码还在） |
+| 整个修复方向错了 | `git checkout dev`，删掉修复分支重来 | 修复分支的改动丢失 |
+| 合并到 dev 后发现问题 | `git revert <merge-commit>`，撤销合并 | 否（revert 是一个新 commit） |
+| 发布到 main 后发现问题 | `git checkout v1.0.0`，回到上个版本 | 否（tag 永远在） |
+
+### 8.10 最佳实践清单
+
+- **每个阶段用独立的 Claude Code 会话**——避免上下文污染
+- **审计阶段只读不写**——把改代码的冲动留到修复阶段
+- **每个修复一个 commit**——方便定位和回退
+- **修复分支上操作，不要在 dev 上直接改**——dev 是你的安全网
+- **审查时看 diff 而不是看全部代码**——聚焦在"改了什么"
+- **测试通过才合并**——CI 的绿色勾是合并的前提
+- **不确定就问 Claude**——"这个改动安全吗？" 比盲目提交好
+
+---
+
+## 9. 常用 Git 命令速查
 
 ### 基础操作
 
@@ -487,7 +850,7 @@ git blame <文件>              # 查看文件每一行是谁写的
 
 ---
 
-## 9. 出问题了怎么办
+## 10. 出问题了怎么办
 
 ### "我还没 commit，但改坏了一个文件，想恢复"
 
