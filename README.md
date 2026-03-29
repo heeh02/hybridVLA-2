@@ -197,6 +197,28 @@ Three-stage progressive training with gradient isolation:
 
 All three stages are managed by a single unified training script (`scripts/train_unified.py`) with automatic stage detection from config, validation evaluation, and checkpoint resumption. For LIBERO benchmarks, a dedicated wrapper (`libero_hybrid/scripts/train_libero.py`) provides one-command training with variant switching (single-cam / multi-cam).
 
+**FSDP training pipeline** (v1.1): The training loop follows a strict initialization order to ensure dtype consistency and correct FSDP behavior:
+
+```
+model = HybridVLAv2(cfg)                       # init
+configure_trainable_modules(model, stage)       # freeze/unfreeze per stage
+validate_config(cfg)                            # fail-fast config checks
+model.to(device)                                # GPU placement
+load_checkpoint(model, ...)                     # cross-stage resume (if any)
+normalize_model_dtypes_for_fsdp(model, bf16)    # all float params → bf16
+verify_model_dtypes(model, bf16)                # dtype audit
+ema = EMAModel(model, ...)                      # EMA shadows in bf16
+model = wrap_fsdp(model, ...)                   # FSDP wrap
+optimizer = AdamW(model.parameters(), ...)      # optimizer on sharded params
+# Training loop with no_sync() for grad accumulation micro-steps
+```
+
+Key FSDP features:
+- **Dtype normalization**: All floating-point params/buffers converted to bf16 before FSDP wrap, preventing mixed-dtype issues from HuggingFace loading and cross-stage resume
+- **Gradient accumulation with `no_sync()`**: Non-final micro-steps skip all-reduce, reducing FSDP communication overhead
+- **Activation checkpointing conflict resolution**: Internal `activation_checkpoint()` in MambaStack auto-detects and defers to FSDP's `CheckpointWrapper` when present, preventing double-checkpointing
+- **Config validation**: `validate_config()` performs 7 fail-fast checks (stage, proprio_key, multi-camera consistency, grad_accum) before any heavy initialization
+
 ## LIBERO Benchmark Integration
 
 v0.10.7 adds a complete **data → train → evaluate** pipeline for the LIBERO benchmark:
@@ -273,9 +295,10 @@ hybridVLA_2/
     train_stage_a.py           # Legacy single-stage script
     train_smoke_test.py        # Config + forward pass validation
     compute_stats.py           # Dataset normalization statistics
+    smoke_fsdp_2gpu.py         # 2-GPU FSDP integration test (torchrun)
   vla_hybrid_v2/
     __init__.py                # Package root (v2.0.0)
-    config.py                  # Structured dataclass configs with YAML loader
+    config.py                  # Structured dataclass configs with YAML loader + validate_config()
     types.py                   # Core types: GrounderOutput, TriRateTemporalState, etc.
     models/
       hybrid_vla_v2.py         # Top-level model: forward_train + control_step
@@ -308,7 +331,7 @@ hybridVLA_2/
       libero_policy.py         # Unified LIBERO inference policy (normalize/denormalize, EMA loading)
     utils/
       checkpointing.py         # Save/load with asset packaging (config + normalizer stats)
-      distributed.py           # FSDP helpers (use_orig_params=True)
+      distributed.py           # FSDP helpers, dtype normalization, use_orig_params=True
       ema.py                   # EMA with FSDP summon_full_params support
   libero_hybrid/               # LIBERO benchmark integration
     scripts/
@@ -317,7 +340,7 @@ hybridVLA_2/
       compute_libero_stats.py  # Normalization statistics for LIBERO
       validate_libero_hdf5.py  # HDF5 structural validation
     utils.py                   # Suite path resolution, demo sorting
-  tests/                       # Unit tests (three-stage, ODE, normalizer, losses, control_step, checkpoint, infer, EMA/FSDP)
+  tests/                       # 130+ unit tests (FSDP dtype/checkpointing, eval dtype safety, config validation, grad accum, etc.)
   docs/                        # Design documents and iteration history (v0.10+ ; pre-v0.10 archived)
   CHANGELOG.md                 # Version history (Keep a Changelog format)
   pyproject.toml               # Project packaging (Python ≥3.10, ruff, pytest)
@@ -330,18 +353,27 @@ hybridVLA_2/
 
 ## Status
 
-**Current version: v1.0.1** — the architecture has been through 20+ iterations of cross-audits and is **multi-GPU training ready** with a complete data → train → evaluate pipeline, CI, and comprehensive documentation.
+**Current version: v1.1** — the architecture has been through 20+ iterations of cross-audits. v1.1 focused on **FSDP production-readiness**: dtype consistency, activation checkpointing conflicts, gradient accumulation communication, config validation, and inference dtype safety. 130+ unit tests, 2-GPU integration test script.
 
-**v1.0.0** consolidated all v0.10.x improvements: Mamba memory management and selective scan fixes, improved consistency loss gradient handling, refactored forward pass and action expert integration, simplified training scripts, FSDP-compatible EMA, and world model code relocated to `experimental/`.
+**v1.1** (12 commits):
+- **FSDP dtype normalization**: Centralized bf16 conversion before FSDP wrap, preventing mixed-dtype issues from HuggingFace loading and cross-stage checkpoint resume
+- **Activation checkpointing conflict**: MambaStack auto-detects FSDP's CheckpointWrapper and skips internal `activation_checkpoint()` to prevent double-checkpointing
+- **Gradient accumulation `no_sync()`**: Non-final micro-steps wrapped in `model.no_sync()`, eliminating redundant all-reduce calls
+- **Config validation**: `validate_config()` with 7 fail-fast checks (stage, proprio_key, multi-camera, grad_accum) called before heavy initialization
+- **Eval dtype safety**: bf16 action tensors cast to fp32 before numpy conversion, fixing inference crash
+- **Multi-camera config fix**: Corrected LIBERO multicam YAML (proprio_key, camera keys, format/dim fields)
+- **2-GPU FSDP smoke test**: End-to-end init → normalize → wrap → train → save → resume → dtype audit
 
-**v1.0.1** added CI pipeline (GitHub Actions for lint and test), full changelog, and Git workflow documentation.
+**v1.0.0–v1.0.1**: Architecture consolidation from v0.10.x, CI pipeline, full changelog, world model code relocated to `experimental/`.
 
 **Ready**:
-- Three-stage training on 8xH100 (Stage A/B/C), multi-GPU FSDP verified
-- LIBERO benchmark training and closed-loop evaluation with proper normalization
+- Three-stage training on 8xH100 (Stage A/B/C), FSDP dtype-safe with activation checkpointing
+- Gradient accumulation with proper `no_sync()` communication optimization
+- LIBERO benchmark training and closed-loop evaluation with bf16-safe inference
 - Unified inference policy with EMA weight loading and checkpoint asset discovery
 - Self-contained checkpoints (model + optimizer + EMA + config + normalizer stats)
-- Unit tests covering three-stage loss, ODE solvers, normalizer, control_step, checkpoint assets, inference policy, EMA/FSDP gaps
+- 130+ unit tests (FSDP dtype, checkpointing, eval dtype safety, config validation, grad accum, etc.)
+- 2-GPU FSDP integration test script (`smoke_fsdp_2gpu.py`)
 - GitHub Actions CI pipeline (lint + test)
 
 **In progress**:
@@ -543,6 +575,24 @@ DreamerV3 风格的潜在世界模型已规划但**尚未启用**（`world_model
 **全局 batch size = 64**（每 GPU 2 × 8 GPU × 4 梯度累积）。**EMA** 衰减从 0.999 渐进到 0.9999，经过 20K 步，从 Stage B 开始。
 
 三个阶段由统一训练脚本（`scripts/train_unified.py`）管理，支持自动阶段检测、验证评估和断点续训。对于 LIBERO 基准，专用包装器（`libero_hybrid/scripts/train_libero.py`）提供一键训练和变体切换（单相机/多相机）。
+
+**FSDP 训练管线**（v1.1）：训练循环遵循严格的初始化顺序以确保 dtype 一致性和正确的 FSDP 行为：
+
+```
+model = HybridVLAv2(cfg)                       # 初始化
+validate_config(cfg)                            # 配置快速失败检查
+load_checkpoint(model, ...)                     # 跨阶段恢复
+normalize_model_dtypes_for_fsdp(model, bf16)    # 所有浮点参数 → bf16
+ema = EMAModel(model, ...)                      # EMA 影子参数
+model = wrap_fsdp(model, ...)                   # FSDP 包裹
+# 训练循环：梯度累积微步使用 no_sync() 跳过 all-reduce
+```
+
+关键 FSDP 特性：
+- **dtype 归一化**：FSDP 包裹前统一所有浮点参数/缓冲区为 bf16，防止 HuggingFace 加载和跨阶段恢复导致的混合 dtype 问题
+- **梯度累积 `no_sync()`**：非最终微步跳过 all-reduce，减少 FSDP 通信开销
+- **激活检查点冲突解决**：MambaStack 自动检测 FSDP 的 `CheckpointWrapper`，避免双重检查点
+- **配置验证**：`validate_config()` 执行 7 项快速失败检查（stage、proprio_key、多相机一致性、grad_accum）
 
 ## LIBERO 基准集成
 

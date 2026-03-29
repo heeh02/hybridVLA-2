@@ -5,6 +5,23 @@ All notable changes to the HybridVLA v2 project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-03-29
+
+### Added
+- Centralized dtype normalization before FSDP wrap (`normalize_model_dtypes_for_fsdp`)
+- Post-load dtype verification (`verify_model_dtypes`)
+- Config validation with 7 fail-fast checks (`validate_config()`)
+- Gradient accumulation `no_sync()` optimization for FSDP
+- 2-GPU FSDP smoke test script (`smoke_fsdp_2gpu.py`)
+- 53 new unit tests: FSDP dtype (10), checkpointing (8), eval dtype safety (12), config validation (15), grad accum (8)
+- FSDP recovery, eval dtype, and sync recovery fix reports
+
+### Fixed
+- FSDP activation checkpointing conflict — MambaStack double-checkpointing with CheckpointWrapper
+- bf16 action tensors crash on numpy conversion during inference/eval
+- LIBERO multicam config: wrong proprio_key, camera keys, missing format/dim fields
+- Mixed dtype state after cross-stage checkpoint resume
+
 ## [1.0.1] - 2026-03-29
 
 ### Added
@@ -82,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Three-stage training pipeline design
 - README (English and Chinese)
 
+[1.1.0]: https://github.com/heeh02/hybridVLA-2/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/heeh02/hybridVLA-2/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/heeh02/hybridVLA-2/compare/v0.10.9...v1.0.0
 [0.10.9]: https://github.com/heeh02/hybridVLA-2/compare/v0.10.7...v0.10.9
