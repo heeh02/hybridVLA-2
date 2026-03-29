@@ -419,6 +419,14 @@ class HybridVLALiberoPolicy:
         action_env = self.action_normalizer.denormalize(action_model)
         lo, hi = self.cfg.model.heads.action_range
         action_env = action_env.clamp(lo, hi)
+
+        # Ensure env-facing tensors are fp32 — bf16 cannot be converted to
+        # numpy and would crash rollout / logging code downstream.
+        if action_env.dtype != torch.float32:
+            action_env = action_env.float()
+        if action_model.dtype != torch.float32:
+            action_model = action_model.float()
+
         runtime_state.prev_action_model = action_model
 
         return LiberoPolicyStepOutput(

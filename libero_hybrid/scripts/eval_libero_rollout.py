@@ -167,7 +167,8 @@ def evaluate_task(
                 )
 
                 action = step_out.action_env[0]  # [A]
-                actions_batch[k] = action.cpu().numpy()
+                # Belt-and-suspenders: ensure fp32 before numpy (bf16 has no numpy equiv)
+                actions_batch[k] = action.float().cpu().numpy()
 
             obs, reward, done, info = env.step(actions_batch)
             total_steps += 1
