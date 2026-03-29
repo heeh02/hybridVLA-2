@@ -204,6 +204,19 @@ def load_checkpoint(
     if unexpected:
         logger.warning("Unexpected %d keys: %s...", len(unexpected), unexpected[:3])
 
+    # Post-load dtype audit: log mixed dtypes so the caller knows whether
+    # normalize_model_dtypes_for_fsdp is needed before FSDP wrap.
+    _float_dtypes: dict = {}
+    for _name, _p in model.named_parameters():
+        if _p.is_floating_point():
+            _float_dtypes.setdefault(str(_p.dtype), []).append(_name)
+    if len(_float_dtypes) > 1:
+        parts = ", ".join(f"{dt}({len(ns)})" for dt, ns in _float_dtypes.items())
+        logger.warning(
+            "Post-load dtype mix: %s — run normalize_model_dtypes_for_fsdp before FSDP wrap",
+            parts,
+        )
+
     if optimizer and (ckpt_dir / "optimizer.pt").exists():
         optim_state = torch.load(
             ckpt_dir / "optimizer.pt", map_location=map_location, weights_only=True,

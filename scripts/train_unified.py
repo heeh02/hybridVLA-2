@@ -389,6 +389,14 @@ def train(cfg: HybridVLAv2Config) -> None:
         logger.info("Loading cross-stage checkpoint: %s", _resume_path)
         _load_ckpt(_resume_path, model, strict=False)
 
+    # ---- dtype normalization (after resume, before EMA/FSDP) ----
+    # All float params -> bf16 so FSDP sharding and EMA shadows are consistent.
+    if cfg.train.fsdp and cfg.train.bf16:
+        from vla_hybrid_v2.utils.distributed import normalize_model_dtypes_for_fsdp
+        from vla_hybrid_v2.utils.distributed import verify_model_dtypes
+        normalize_model_dtypes_for_fsdp(model, target_dtype=torch.bfloat16)
+        verify_model_dtypes(model, expected_dtype=torch.bfloat16, label="pre-FSDP")
+
     # ---- EMA (after cross-stage resume, before FSDP so shadows hold full unsharded params) ----
     ema = None
     if cfg.model.ema.enable:

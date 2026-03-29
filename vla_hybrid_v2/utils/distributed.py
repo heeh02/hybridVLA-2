@@ -151,6 +151,76 @@ def _apply_activation_checkpointing(
         logger.warning("torch checkpoint_wrapper not available.")
 
 
+# ---------------------------------------------------------------------------
+# FSDP dtype normalization & verification
+# ---------------------------------------------------------------------------
+
+
+def normalize_model_dtypes_for_fsdp(
+    model: nn.Module,
+    target_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Cast all floating-point params/buffers to *target_dtype* before FSDP wrap.
+
+    With ``use_orig_params=True``, FSDP stores params in their original dtype
+    and casts to ``param_dtype`` during forward.  Pre-normalizing to bf16:
+    1. halves param + optimizer-state memory,
+    2. makes checkpoints consistent across save/resume,
+    3. eliminates hidden float32 stragglers (e.g. SSM A_log, D).
+
+    Safe for backbone params already in bf16 (no-op cast).
+    Integer/bool buffers are untouched by ``is_floating_point()`` guard.
+
+    Call AFTER ``model.to(device)`` + checkpoint load, BEFORE EMA + FSDP wrap.
+    """
+    converted = 0
+    for name, param in model.named_parameters():
+        if param.is_floating_point() and param.dtype != target_dtype:
+            param.data = param.data.to(target_dtype)
+            converted += 1
+    for name, buf in model.named_buffers():
+        if buf.is_floating_point() and buf.dtype != target_dtype:
+            buf.data = buf.data.to(target_dtype)
+            converted += 1
+    logger.info(
+        "normalize_model_dtypes_for_fsdp: converted %d tensors -> %s",
+        converted, target_dtype,
+    )
+
+
+def verify_model_dtypes(
+    model: nn.Module,
+    expected_dtype: torch.dtype = torch.bfloat16,
+    label: str = "",
+) -> bool:
+    """Check all floating-point params have *expected_dtype*.  Returns True if OK.
+
+    Use after checkpoint load to detect dtype regression.
+    """
+    tag = f" [{label}]" if label else ""
+    violations = []
+    for name, param in model.named_parameters():
+        if param.is_floating_point() and param.dtype != expected_dtype:
+            violations.append((name, param.dtype))
+    if violations:
+        logger.warning(
+            "dtype verification%s FAILED: %d params not %s",
+            tag, len(violations), expected_dtype,
+        )
+        for name, dtype in violations[:10]:
+            logger.warning("  %s: %s", name, dtype)
+        if len(violations) > 10:
+            logger.warning("  ... and %d more", len(violations) - 10)
+        return False
+    logger.info("dtype verification%s: all params %s", tag, expected_dtype)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Gradient clipping
+# ---------------------------------------------------------------------------
+
+
 def clip_grad_norm_fsdp(model: nn.Module, max_norm: float) -> torch.Tensor:
     try:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
