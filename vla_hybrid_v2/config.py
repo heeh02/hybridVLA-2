@@ -400,6 +400,87 @@ def _dict_to_dataclass(cls, data: dict):
     return cls(**kwargs)
 
 
+def validate_config(cfg: HybridVLAv2Config) -> None:
+    """Pre-training config validation — fail-fast on inconsistencies.
+
+    Raises ``ValueError`` with an actionable message for every detected
+    problem so users don't have to chase silent data-loading failures.
+    """
+    errors: list[str] = []
+
+    # --- Stage ---
+    if cfg.stage not in ("a", "b", "c"):
+        errors.append(
+            f"stage must be 'a', 'b', or 'c', got '{cfg.stage}'."
+        )
+
+    # --- proprio_key / proprio_keys consistency ---
+    dcfg = cfg.data
+    if dcfg.proprio_keys:
+        if dcfg.proprio_key not in dcfg.proprio_keys:
+            errors.append(
+                f"data.proprio_key='{dcfg.proprio_key}' is not in "
+                f"data.proprio_keys={dcfg.proprio_keys}. "
+                f"Set proprio_key to the first element of proprio_keys."
+            )
+
+    # Warn about V1-style proprio_key when using LIBERO format
+    if dcfg.format == "libero_hdf5" and dcfg.proprio_key == "robot0_joint_pos":
+        errors.append(
+            f"data.proprio_key='robot0_joint_pos' is V1-style but "
+            f"data.format='libero_hdf5'. LIBERO uses 'joint_states'. "
+            f"Set data.proprio_key='joint_states' and "
+            f"data.proprio_keys=['joint_states', 'gripper_states']."
+        )
+
+    # --- Multi-camera self-consistency ---
+    mc = cfg.model.multi_camera
+    if mc.enable:
+        if mc.num_cameras < 2:
+            errors.append(
+                f"model.multi_camera.enable=True but num_cameras={mc.num_cameras}. "
+                f"Multi-camera requires num_cameras >= 2."
+            )
+        if len(mc.camera_names) != mc.num_cameras:
+            errors.append(
+                f"model.multi_camera.camera_names has {len(mc.camera_names)} "
+                f"entries but num_cameras={mc.num_cameras}. They must match."
+            )
+        if dcfg.camera_keys and len(dcfg.camera_keys) != mc.num_cameras:
+            errors.append(
+                f"data.camera_keys has {len(dcfg.camera_keys)} entries "
+                f"but model.multi_camera.num_cameras={mc.num_cameras}. "
+                f"Provide exactly one camera_key per camera."
+            )
+        if mc.num_cameras > mc.max_cameras:
+            errors.append(
+                f"model.multi_camera.num_cameras={mc.num_cameras} exceeds "
+                f"max_cameras={mc.max_cameras}."
+            )
+
+    # --- Proprio dim vs proprio_keys ---
+    if dcfg.format == "libero_hdf5" and dcfg.proprio_keys:
+        _KNOWN_DIMS = {"joint_states": 7, "gripper_states": 2}
+        known_total = sum(_KNOWN_DIMS.get(k, 0) for k in dcfg.proprio_keys)
+        if known_total > 0 and cfg.model.proprio_dim != known_total:
+            errors.append(
+                f"model.proprio_dim={cfg.model.proprio_dim} but "
+                f"data.proprio_keys={dcfg.proprio_keys} sum to "
+                f"{known_total}. Set model.proprio_dim={known_total}."
+            )
+
+    # --- grad_accum_steps ---
+    if cfg.train.grad_accum_steps < 1:
+        errors.append(
+            f"train.grad_accum_steps must be >= 1, got {cfg.train.grad_accum_steps}."
+        )
+
+    if errors:
+        header = f"Config validation failed ({len(errors)} issue(s)):\n"
+        body = "\n".join(f"  [{i+1}] {e}" for i, e in enumerate(errors))
+        raise ValueError(header + body)
+
+
 def load_config(path: str | Path) -> HybridVLAv2Config:
     path = Path(path)
     with open(path) as f:

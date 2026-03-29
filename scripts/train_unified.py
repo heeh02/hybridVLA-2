@@ -35,7 +35,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 import yaml
 
-from vla_hybrid_v2.config import HybridVLAv2Config, load_config
+from vla_hybrid_v2.config import HybridVLAv2Config, load_config, validate_config
 from vla_hybrid_v2.data import build_dataset
 from vla_hybrid_v2.utils.checkpointing import auto_resume, save_checkpoint
 from vla_hybrid_v2.utils.distributed import (
@@ -345,6 +345,9 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 def train(cfg: HybridVLAv2Config) -> None:
+    # Fail-fast: validate config before any heavy initialization
+    validate_config(cfg)
+
     local_rank = setup_distributed(seed=42)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     setup_logging(cfg.train.output_dir)
