@@ -404,6 +404,28 @@ class _MambaStack(nn.Module):
             ]
         return ssm, conv
 
+    @staticmethod
+    def _unwrap_layer(layer: nn.Module) -> "MambaBlock":
+        """Return the underlying MambaBlock, looking through CheckpointWrapper."""
+        # After FSDP activation checkpointing, layers[i] may be a
+        # CheckpointWrapper whose ._checkpoint_wrapped_module is MambaBlock.
+        wrapped = getattr(layer, "_checkpoint_wrapped_module", None)
+        if wrapped is not None:
+            return wrapped
+        return layer  # type: ignore[return-value]
+
+    def _fsdp_manages_checkpointing(self) -> bool:
+        """True if FSDP checkpoint_wrapper has been applied to our layers."""
+        if not self.layers:
+            return False
+        try:
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                CheckpointWrapper,
+            )
+            return isinstance(self.layers[0], CheckpointWrapper)
+        except ImportError:
+            return False
+
     def forward(
         self,
         x: Tensor,
@@ -423,7 +445,8 @@ class _MambaStack(nn.Module):
             this when cross-step state persistence is not needed (e.g.
             ActionHistoryEncoder).
         """
-        uses_official = self.layers[0]._use_official if self.layers else False
+        inner0 = self._unwrap_layer(self.layers[0]) if self.layers else None
+        uses_official = inner0._use_official if inner0 is not None else False
 
         if ssm_states is None or conv_states is None:
             ssm_states_list: List[Optional[Tensor]] = [None] * self.num_layers
@@ -433,15 +456,17 @@ class _MambaStack(nn.Module):
             conv_states_list = list(conv_states)
 
         # --- Official stateless fast-path (fused kernel, no state return) ---
+        # Use layer(x) instead of layer._forward_official(x) so the call
+        # routes through CheckpointWrapper when FSDP checkpointing is active.
         if uses_official and stateless:
             for layer in self.layers:
-                x, _, _ = layer._forward_official(x)
+                x, _, _ = layer(x)
             empty: List[Tensor] = []
             return x, empty, empty
 
         # --- Official stateful path (token-by-token step loop) ---
         # Only reached when mamba_impl="auto" AND the caller needs states.
-        # Kept for inference where single-token step() is the natural mode.
+        # Uses _unwrap_layer for step() (inference only, no checkpointing).
         if uses_official:
             is_single = x.dim() == 2
             if is_single:
@@ -451,7 +476,8 @@ class _MambaStack(nn.Module):
             for t in range(x.shape[1]):
                 x_t = x[:, t, :]  # [B, D]
                 for i, layer in enumerate(self.layers):
-                    x_t, ssm_states_list[i], conv_states_list[i] = layer.step(
+                    inner = self._unwrap_layer(layer)
+                    x_t, ssm_states_list[i], conv_states_list[i] = inner.step(
                         x_t, ssm_states_list[i], conv_states_list[i],
                     )
                 out[:, t, :] = x_t
@@ -462,6 +488,9 @@ class _MambaStack(nn.Module):
             return out, ssm_states_list, conv_states_list  # type: ignore[return-value]
 
         # --- Fallback path (vectorized per-layer, supports checkpointing) ---
+        # Skip internal activation_checkpoint when FSDP checkpoint_wrapper
+        # already wraps our layers — avoids double-checkpointing overhead.
+        fsdp_ckpt = self._fsdp_manages_checkpointing()
         new_ssm: List[Tensor] = []
         new_conv: List[Tensor] = []
 
@@ -469,7 +498,7 @@ class _MambaStack(nn.Module):
             s_i = ssm_states_list[i]
             c_i = conv_states_list[i]
 
-            if use_checkpoint and self.training:
+            if use_checkpoint and self.training and not fsdp_ckpt:
                 x, s, c = activation_checkpoint(
                     layer, x, s_i, c_i, use_reentrant=False,
                 )
