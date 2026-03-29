@@ -40,3 +40,11 @@ datasets/
 # Jupyter
 .ipynb_checkpoints/
 libero_hybrid/reference/LIBERO
+
+# HPC / cluster credentials and scripts (PRIVATE - never commit)
+*hpc*
+*HPC*
+sync_to_*
+**/hpc_connect*
+**/cluster_config*
+**/slurm_*

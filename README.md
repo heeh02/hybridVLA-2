@@ -169,7 +169,7 @@ Additional heads:
 
 ### 6. World Model (TODO)
 
-A DreamerV3-inspired latent world model is planned but **not yet enabled** (`world_model.enable = false`). The code scaffold exists in `vla_hybrid_v2/world_model/` and includes:
+A DreamerV3-inspired latent world model is planned but **not yet enabled** (`world_model.enable = false`). The code scaffold exists in `vla_hybrid_v2/experimental/world_model/` and includes:
 
 - `ImaginationEngine` — 32-step latent rollout orchestrator
 - `ImaginationMamba` — 8-layer Mamba for latent dynamics
@@ -260,10 +260,14 @@ Per-GPU memory (FSDP full-shard, bs=2): ~50-55 GB / 80 GB, leaving ~25 GB headro
 
 ```
 hybridVLA_2/
+  .github/
+    workflows/
+      ci.yml                   # GitHub Actions: lint (ruff) + test (pytest)
   configs/
     model/                     # Architecture configs (YAML)
     train/                     # Per-stage training configs (stage_a/b/c + compressed variants)
     data/                      # Dataset configs (libero_singlecam, libero_multicam)
+    infer/                     # Inference configs
   scripts/
     train_unified.py           # Unified training entry point (Stage A/B/C)
     train_stage_a.py           # Legacy single-stage script
@@ -284,8 +288,10 @@ hybridVLA_2/
       flow_matching.py         # Rectified Flow MSE loss + logit-normal timestep sampling
       discrete_loss.py         # Cross-entropy with label smoothing
       consistency_loss.py      # Contrastive temporal + slow-fast agreement + action consistency
-    world_model/               # TODO: not yet enabled (enable: false)
-      ...                      # ImaginationEngine, StochasticState, PhysicsEngine, etc.
+    experimental/
+      world_model/             # TODO: not yet enabled (enable: false)
+        ...                    # ImaginationEngine, StochasticState, PhysicsEngine, etc.
+    world_model/               # Re-exports from experimental/ for backward compatibility
     ops/
       selective_scan.py        # JIT-compiled SSM scan + CUDA dispatch
     data/
@@ -311,8 +317,9 @@ hybridVLA_2/
       compute_libero_stats.py  # Normalization statistics for LIBERO
       validate_libero_hdf5.py  # HDF5 structural validation
     utils.py                   # Suite path resolution, demo sorting
-  tests/                       # Unit tests (three-stage, ODE, normalizer, losses, control_step, checkpoint, infer)
+  tests/                       # Unit tests (three-stage, ODE, normalizer, losses, control_step, checkpoint, infer, EMA/FSDP)
   docs/                        # Design documents and iteration history (v0.10+ ; pre-v0.10 archived)
+  CHANGELOG.md                 # Version history (Keep a Changelog format)
   pyproject.toml               # Project packaging (Python ≥3.10, ruff, pytest)
 ```
 
@@ -323,18 +330,19 @@ hybridVLA_2/
 
 ## Status
 
-The architecture (v0.10.9, score 8.7/10) has been through 20+ iterations of cross-audits and is **multi-GPU training ready** with a complete data → train → evaluate pipeline.
+**Current version: v1.0.1** — the architecture has been through 20+ iterations of cross-audits and is **multi-GPU training ready** with a complete data → train → evaluate pipeline, CI, and comprehensive documentation.
 
-**v0.10.8** added a unified inference policy (`HybridVLALiberoPolicy`) that handles action/proprio normalization alignment between training and inference, self-contained checkpoint asset packaging (config + normalizer stats bundled into each checkpoint), and EMA weight loading at inference time.
+**v1.0.0** consolidated all v0.10.x improvements: Mamba memory management and selective scan fixes, improved consistency loss gradient handling, refactored forward pass and action expert integration, simplified training scripts, FSDP-compatible EMA, and world model code relocated to `experimental/`.
 
-**v0.10.9** fixed critical multi-GPU issues: FSDP evaluate() deadlock (all ranks now participate with `dist.all_reduce`), EMA/FSDP parameter name mismatch (EMA initialized before FSDP wrapping, uses `summon_full_params` for apply/restore), validation using EMA weights, per-module gradient norm logging timing, and action clipping at inference boundaries.
+**v1.0.1** added CI pipeline (GitHub Actions for lint and test), full changelog, and Git workflow documentation.
 
 **Ready**:
 - Three-stage training on 8xH100 (Stage A/B/C), multi-GPU FSDP verified
 - LIBERO benchmark training and closed-loop evaluation with proper normalization
 - Unified inference policy with EMA weight loading and checkpoint asset discovery
 - Self-contained checkpoints (model + optimizer + EMA + config + normalizer stats)
-- Unit tests covering three-stage loss, ODE solvers, normalizer, control_step, checkpoint assets, inference policy
+- Unit tests covering three-stage loss, ODE solvers, normalizer, control_step, checkpoint assets, inference policy, EMA/FSDP gaps
+- GitHub Actions CI pipeline (lint + test)
 
 **In progress**:
 - Actual training runs and hyperparameter tuning
@@ -508,7 +516,7 @@ output = sigmoid(gate) * ((1 + scale) * RMSNorm(x) + shift)
 
 ### 6. 世界模型 (TODO)
 
-DreamerV3 风格的潜在世界模型已规划但**尚未启用**（`world_model.enable = false`）。代码框架存在于 `vla_hybrid_v2/world_model/` 中，包括：
+DreamerV3 风格的潜在世界模型已规划但**尚未启用**（`world_model.enable = false`）。代码框架存在于 `vla_hybrid_v2/experimental/world_model/` 中，包括：
 
 - `ImaginationEngine` — 32 步潜在 rollout 编排器
 - `ImaginationMamba` — 8 层 Mamba 用于潜在动力学

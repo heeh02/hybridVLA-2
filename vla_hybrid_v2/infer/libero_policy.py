@@ -346,16 +346,25 @@ class HybridVLALiberoPolicy:
         self,
         obs_single: dict,
         language: str,
+        runtime_state: Optional[LiberoPolicyRuntime] = None,
     ) -> GrounderOutput:
-        """Run semantic_step() from raw LIBERO observations."""
+        """Run semantic_step() from raw LIBERO observations.
+
+        When *runtime_state* is provided, ``refresh_counter`` is incremented
+        automatically so that the next ``control_step`` detects the new
+        semantic summary and re-generates the action chunk.
+        """
         sem_input = self.obs_to_semantic_input(obs_single, language)
-        return self.model.semantic_step(
+        result = self.model.semantic_step(
             input_ids=sem_input["input_ids"],
             attention_mask=sem_input["attention_mask"],
             pixel_values=sem_input.get("pixel_values"),
             image_grid_thw=sem_input.get("image_grid_thw"),
             num_cameras=self.num_cameras,
         )
+        if runtime_state is not None:
+            runtime_state.runtime_cache.refresh_counter += 1
+        return result
 
     def obs_to_raw_proprio(self, obs_single: dict) -> torch.Tensor:
         """Extract raw proprio features from one env observation."""

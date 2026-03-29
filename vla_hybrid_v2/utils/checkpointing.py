@@ -34,6 +34,44 @@ def _get_state_dict(model: nn.Module) -> Dict[str, Any]:
     return model.state_dict()
 
 
+def _get_optim_state_dict(
+    model: nn.Module, optimizer: torch.optim.Optimizer,
+) -> Dict[str, Any]:
+    """Get optimizer state dict — FSDP-aware (COLLECTIVE on all ranks)."""
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        if isinstance(model, FSDP):
+            # COLLECTIVE: all ranks participate; rank0 gets the full result.
+            return FSDP.full_optim_state_dict(model, optimizer)
+    except ImportError:
+        pass
+    return optimizer.state_dict()
+
+
+def _load_optim_state_dict(
+    optim_state: Dict[str, Any],
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    """Load optimizer state dict — FSDP-aware (shards full state per rank)."""
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        if isinstance(model, FSDP):
+            # PyTorch 2.1+
+            if hasattr(FSDP, "optim_state_dict_to_load"):
+                sharded = FSDP.optim_state_dict_to_load(
+                    model, optimizer, optim_state,
+                )
+            else:
+                # PyTorch 2.0
+                sharded = FSDP.shard_full_optim_state_dict(optim_state, model)
+            optimizer.load_state_dict(sharded)
+            return
+    except (ImportError, AttributeError):
+        pass
+    optimizer.load_state_dict(optim_state)
+
+
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -47,7 +85,9 @@ def save_checkpoint(
 ) -> Optional[Path]:
     """Save training checkpoint (rank 0 only)."""
     output_dir = Path(output_dir)
+    # COLLECTIVE ops — all ranks must participate before the rank-0 guard.
     model_state = _get_state_dict(model)
+    optim_state = _get_optim_state_dict(model, optimizer)
 
     if not is_main_process():
         if dist.is_initialized():
@@ -60,7 +100,7 @@ def save_checkpoint(
 
     try:
         torch.save(model_state, tmp_dir / "model.pt")
-        torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
+        torch.save(optim_state, tmp_dir / "optimizer.pt")
         if scheduler is not None:
             torch.save(scheduler.state_dict(), tmp_dir / "scheduler.pt")
         if ema is not None:
@@ -165,9 +205,10 @@ def load_checkpoint(
         logger.warning("Unexpected %d keys: %s...", len(unexpected), unexpected[:3])
 
     if optimizer and (ckpt_dir / "optimizer.pt").exists():
-        optimizer.load_state_dict(
-            torch.load(ckpt_dir / "optimizer.pt", map_location=map_location, weights_only=True)
+        optim_state = torch.load(
+            ckpt_dir / "optimizer.pt", map_location=map_location, weights_only=True,
         )
+        _load_optim_state_dict(optim_state, model, optimizer)
     if scheduler and (ckpt_dir / "scheduler.pt").exists():
         scheduler.load_state_dict(
             torch.load(ckpt_dir / "scheduler.pt", map_location=map_location, weights_only=True)

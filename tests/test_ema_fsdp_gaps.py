@@ -326,6 +326,68 @@ class TestCrossStageResumeEMAOrder:
         assert ema2.final_decay == 0.999
         assert ema2.ramp_steps == 5000
 
+    def test_state_dict_returns_copy_not_alias(self):
+        """P2: state_dict() must return a deep copy — mutating the returned
+        dict must not affect the source EMA shadow."""
+        from vla_hybrid_v2.utils.ema import EMAModel
+
+        model = nn.Linear(4, 3)
+        ema = EMAModel(model)
+        original_weight = ema.shadow["weight"].clone()
+
+        state = ema.state_dict()
+        # Mutate the returned shadow
+        state["shadow"]["weight"].zero_()
+
+        # Source EMA should be untouched
+        assert torch.equal(ema.shadow["weight"], original_weight), \
+            "state_dict() returned a live reference — source EMA was mutated!"
+
+    def test_load_state_dict_does_not_mutate_input(self):
+        """P2: load_state_dict() must not modify the caller's state dict."""
+        from vla_hybrid_v2.utils.ema import EMAModel
+
+        # Source model: 4->4
+        source_model = nn.Linear(4, 4)
+        ema_source = EMAModel(source_model)
+        state = ema_source.state_dict()
+        source_keys_before = set(state["shadow"].keys())
+
+        # Target model has different shape — triggers shape-mismatch filter
+        target_model = nn.Linear(4, 3)
+        ema_target = EMAModel(target_model)
+        ema_target.load_state_dict(state)
+
+        # Source state dict must be completely untouched
+        assert set(state["shadow"].keys()) == source_keys_before, \
+            "load_state_dict() mutated the input state dict keys!"
+
+    def test_load_state_dict_filters_orphan_keys(self):
+        """P2: orphan shadow keys (from removed modules) must not survive load."""
+        from vla_hybrid_v2.utils.ema import EMAModel
+
+        model = nn.Linear(4, 3)
+        ema = EMAModel(model)
+
+        # Construct a state with an extra key that doesn't exist in current model
+        fake_state = {
+            "shadow": {
+                "weight": torch.randn(3, 4),
+                "bias": torch.randn(3),
+                "removed_module.weight": torch.randn(8, 8),  # orphan
+            },
+            "initial_decay": 0.999,
+            "final_decay": 0.9999,
+            "ramp_steps": 20000,
+        }
+
+        ema.load_state_dict(fake_state)
+
+        assert "removed_module.weight" not in ema.shadow, \
+            "Orphan key survived load_state_dict!"
+        assert "weight" in ema.shadow
+        assert "bias" in ema.shadow
+
 
 # ---------------------------------------------------------------------------
 # D: TriRateMambaCore smoke test
@@ -479,7 +541,9 @@ class TestGrounderSmoke:
         grounder = self._make_grounder()
         features = torch.randn(B, L, D, requires_grad=True)
         out = grounder(features)
-        loss = out.global_token.sum() + out.compressed_object_slots.sum()
+        # Use .pow(2).mean() instead of .sum() — LayerNorm makes .sum() ≈ 0,
+        # which produces near-zero gradients and flaky assertion failures.
+        loss = out.global_token.pow(2).mean() + out.compressed_object_slots.pow(2).mean()
         loss.backward()
 
         assert features.grad is not None
@@ -584,3 +648,60 @@ class TestFSDPTrainingStepSimulation:
             if p.requires_grad and not torch.equal(p.data, init_weights[n])
         )
         assert changed > 0, "No weights changed after training step"
+
+
+# ---------------------------------------------------------------------------
+# P2: Gradient accumulation counter logic
+# ---------------------------------------------------------------------------
+
+
+class TestGradAccumCounter:
+    """Verify the persistent micro_step counter avoids cross-epoch mixing."""
+
+    def test_persistent_counter_no_cross_epoch_contamination(self):
+        """Simulate 2 epochs with grad_accum=4 and 5 batches/epoch.
+        micro_step counter must be continuous; each optimizer.step covers
+        exactly grad_accum micro-batches."""
+        grad_accum = 4
+        batches_per_epoch = 5
+        micro_step = 0
+        steps = []  # (step_number, micro_batches_in_this_step)
+        step_count = 0
+
+        for epoch in range(2):
+            for batch_idx in range(batches_per_epoch):
+                micro_step += 1
+                if micro_step % grad_accum == 0:
+                    step_count += 1
+                    steps.append(("step", grad_accum))
+
+        # Flush tail
+        if micro_step % grad_accum != 0:
+            tail = micro_step % grad_accum
+            steps.append(("flush", tail))
+
+        # Total micro-batches processed = 2 * 5 = 10
+        assert micro_step == 10
+
+        # Steps: micro_step 4 (step), micro_step 8 (step), flush at 10 (2 leftover)
+        assert len(steps) == 3
+        assert steps[0] == ("step", 4)
+        assert steps[1] == ("step", 4)
+        assert steps[2] == ("flush", 2)
+
+    def test_no_contamination_with_exact_divisibility(self):
+        """When batches_per_epoch is a multiple of grad_accum, no flush needed."""
+        grad_accum = 4
+        batches_per_epoch = 8
+        micro_step = 0
+        step_count = 0
+
+        for epoch in range(2):
+            for batch_idx in range(batches_per_epoch):
+                micro_step += 1
+                if micro_step % grad_accum == 0:
+                    step_count += 1
+
+        assert micro_step == 16
+        assert step_count == 4  # 16 / 4 = 4 optimizer steps
+        assert micro_step % grad_accum == 0  # no tail to flush

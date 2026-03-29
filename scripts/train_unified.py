@@ -498,6 +498,7 @@ def train(cfg: HybridVLAv2Config) -> None:
     step_start = time.monotonic()
     accum_loss: Dict[str, float] = {}
     grad_accum = cfg.train.grad_accum_steps
+    micro_step = 0  # persistent counter — never resets across epochs
 
     def _to_device(v):
         if isinstance(v, torch.Tensor):
@@ -521,11 +522,12 @@ def train(cfg: HybridVLAv2Config) -> None:
 
             loss = losses["loss_total"] / grad_accum
             loss.backward()
+            micro_step += 1
 
             for k, v in losses.items():
                 accum_loss[k] = accum_loss.get(k, 0.0) + v.detach().item()
 
-            if (batch_idx + 1) % grad_accum == 0:
+            if micro_step % grad_accum == 0:
                 grad_norm = clip_grad_norm_fsdp(model, cfg.train.max_grad_norm)
                 # V5: per-module gradient norm — must run before zero_grad
                 next_step = global_step + 1
@@ -590,6 +592,18 @@ def train(cfg: HybridVLAv2Config) -> None:
 
         if global_step >= cfg.train.max_steps:
             break
+
+    # ---- Flush tail micro-batches that didn't reach a full accumulation ----
+    if micro_step % grad_accum != 0 and global_step < cfg.train.max_steps:
+        tail_count = micro_step % grad_accum
+        logger.info("Flushing %d/%d tail micro-batches.", tail_count, grad_accum)
+        grad_norm = clip_grad_norm_fsdp(model, cfg.train.max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        if ema is not None:
+            ema.update(model, global_step)
+        global_step += 1
 
     save_checkpoint(model, optimizer, global_step, cfg.train.output_dir,
                     epoch=epoch, scheduler=scheduler, ema=ema,

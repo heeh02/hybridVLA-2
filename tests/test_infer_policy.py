@@ -51,6 +51,18 @@ class _DummyModel:
     def init_runtime(self, batch_size=1, device="cpu"):
         return RuntimeCache(device=torch.device(device))
 
+    def semantic_step(self, input_ids, attention_mask, **kwargs):
+        dim = self.cfg.model.grounder.hidden_size
+        B = input_ids.shape[0]
+        return GrounderOutput(
+            global_token=torch.zeros(B, dim),
+            object_slots=torch.zeros(B, 4, dim),
+            compressed_object_slots=torch.zeros(B, 2, dim),
+            phase_token=torch.zeros(B, dim),
+            uncertainty_token=torch.zeros(B, dim),
+            affordance_token=torch.zeros(B, dim),
+        )
+
     def control_step(
         self,
         proprio,
@@ -145,3 +157,68 @@ class TestHybridVLALiberoPolicy:
                 },
                 "pick up the block",
             )
+
+    def test_semantic_step_increments_refresh_counter(self):
+        """P1: semantic_step_from_obs must bump refresh_counter so that
+        the next control_step detects a new semantic summary."""
+        from unittest.mock import patch
+
+        cfg = _mini_cfg("b")
+        cfg.data.proprio_keys = ["joint_states", "gripper_states"]
+        cfg.data.proprio_key = "joint_states"
+        action_norm, proprio_norm = _fit_normalizers()
+        model = _DummyModel(cfg)
+        policy = HybridVLALiberoPolicy(
+            model=model, cfg=cfg, processor=object(),
+            action_normalizer=action_norm, proprio_normalizer=proprio_norm,
+            device="cpu",
+        )
+        runtime = policy.init_runtime()
+
+        assert runtime.runtime_cache.refresh_counter == 0
+
+        # Bypass processor tokenization — directly test the counter logic
+        fake_sem_input = {
+            "input_ids": torch.randint(0, 100, (1, 16)),
+            "attention_mask": torch.ones(1, 16, dtype=torch.long),
+        }
+        with patch.object(policy, "obs_to_semantic_input", return_value=fake_sem_input):
+            policy.semantic_step_from_obs(
+                {"agentview_image": np.zeros((128, 128, 3), dtype=np.uint8)},
+                "pick up the block",
+                runtime_state=runtime,
+            )
+        assert runtime.runtime_cache.refresh_counter == 1
+
+        # Second semantic step — counter should increment again
+        with patch.object(policy, "obs_to_semantic_input", return_value=fake_sem_input):
+            policy.semantic_step_from_obs(
+                {"agentview_image": np.zeros((128, 128, 3), dtype=np.uint8)},
+                "pick up the block",
+                runtime_state=runtime,
+            )
+        assert runtime.runtime_cache.refresh_counter == 2
+
+    def test_semantic_step_without_runtime_no_side_effect(self):
+        """Backward compat: calling without runtime_state should not crash."""
+        from unittest.mock import patch
+
+        cfg = _mini_cfg("b")
+        action_norm, proprio_norm = _fit_normalizers()
+        model = _DummyModel(cfg)
+        policy = HybridVLALiberoPolicy(
+            model=model, cfg=cfg, processor=object(),
+            action_normalizer=action_norm, proprio_normalizer=proprio_norm,
+            device="cpu",
+        )
+
+        fake_sem_input = {
+            "input_ids": torch.randint(0, 100, (1, 16)),
+            "attention_mask": torch.ones(1, 16, dtype=torch.long),
+        }
+        with patch.object(policy, "obs_to_semantic_input", return_value=fake_sem_input):
+            result = policy.semantic_step_from_obs(
+                {"agentview_image": np.zeros((128, 128, 3), dtype=np.uint8)},
+                "pick up the block",
+            )
+        assert result is not None  # no crash, returns GrounderOutput

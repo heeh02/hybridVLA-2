@@ -5,6 +5,14 @@ All notable changes to the HybridVLA v2 project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-03-29
+
+### Added
+- GitHub Actions CI pipeline (ruff lint + pytest)
+- CHANGELOG.md with full version history
+- Git workflow beginner guide (Chinese)
+- Claude Code + Git workflow section in docs
+
 ## [1.0.0] - 2026-03-29
 
 ### Added
@@ -74,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Three-stage training pipeline design
 - README (English and Chinese)
 
+[1.0.1]: https://github.com/heeh02/hybridVLA-2/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/heeh02/hybridVLA-2/compare/v0.10.9...v1.0.0
 [0.10.9]: https://github.com/heeh02/hybridVLA-2/compare/v0.10.7...v0.10.9
 [0.10.7]: https://github.com/heeh02/hybridVLA-2/compare/v0.10.5...v0.10.7

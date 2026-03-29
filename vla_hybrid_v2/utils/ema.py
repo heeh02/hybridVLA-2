@@ -114,19 +114,22 @@ class EMAModel:
 
     def state_dict(self) -> dict:
         return {
-            "shadow": self.shadow,
+            "shadow": {k: v.clone() for k, v in self.shadow.items()},
             "initial_decay": self.initial_decay,
             "final_decay": self.final_decay,
             "ramp_steps": self.ramp_steps,
         }
 
     def load_state_dict(self, state: dict) -> None:
-        loaded_shadow = state["shadow"]
+        # Work on a shallow copy so we never mutate the caller's dict.
+        loaded_shadow = dict(state["shadow"])
+
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
+
         # Filter out shape-mismatched keys (e.g. ActionHistoryEncoder resized
         # in v0.10.10).  Mismatched shadows are dropped and will be
         # re-initialised from the current model params at the next update().
-        import logging as _logging
-        _logger = _logging.getLogger(__name__)
         dropped = []
         for k in list(loaded_shadow.keys()):
             if k in self.shadow and loaded_shadow[k].shape != self.shadow[k].shape:
@@ -141,6 +144,17 @@ class EMAModel:
                 "(pre-v0.10.10 checkpoint):\n%s",
                 len(dropped), "\n".join(dropped[:10]),
             )
+
+        # Filter out orphan keys (parameter no longer exists in current model).
+        orphans = [k for k in loaded_shadow if k not in self.shadow]
+        for k in orphans:
+            del loaded_shadow[k]
+        if orphans:
+            _logger.warning(
+                "EMA: dropped %d orphan shadow keys not in current model: %s",
+                len(orphans), orphans[:10],
+            )
+
         self.shadow.update(loaded_shadow)
         self.initial_decay = state.get("initial_decay", self.initial_decay)
         self.final_decay = state.get("final_decay", self.final_decay)
