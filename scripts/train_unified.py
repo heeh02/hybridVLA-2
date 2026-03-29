@@ -27,6 +27,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -498,6 +500,16 @@ def train(cfg: HybridVLAv2Config) -> None:
     step_start = time.monotonic()
     accum_loss: Dict[str, float] = {}
     grad_accum = cfg.train.grad_accum_steps
+
+    # no_sync context: skip FSDP all-reduce on non-final accumulation micro-steps.
+    # On single-GPU or non-FSDP this is a no-op (contextlib.nullcontext).
+    _has_no_sync = hasattr(model, "no_sync")
+    def _maybe_no_sync(is_accumulating: bool):
+        """Return model.no_sync() when accumulating, nullcontext otherwise."""
+        if is_accumulating and _has_no_sync:
+            return model.no_sync()
+        return contextlib.nullcontext()
+
     micro_step = 0  # persistent counter — never resets across epochs
 
     def _to_device(v):
@@ -517,11 +529,15 @@ def train(cfg: HybridVLAv2Config) -> None:
 
             batch = {k: _to_device(v) for k, v in batch.items()}
 
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=cfg.train.bf16):
-                losses = model.forward_train(batch)
+            # Determine whether this micro-step is still accumulating
+            is_accumulating = (micro_step + 1) % grad_accum != 0
 
-            loss = losses["loss_total"] / grad_accum
-            loss.backward()
+            with _maybe_no_sync(is_accumulating):
+                with torch.autocast(device.type, dtype=torch.bfloat16, enabled=cfg.train.bf16):
+                    losses = model.forward_train(batch)
+
+                loss = losses["loss_total"] / grad_accum
+                loss.backward()
             micro_step += 1
 
             for k, v in losses.items():
