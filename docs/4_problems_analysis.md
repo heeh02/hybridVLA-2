@@ -1,8 +1,10 @@
 # HybridVLA v2 — 四项关键问题深度分析
 
-> **分析日期**: 2026-03-29
+> **分析日期**: 2026-03-29（修订 2026-03-30）
 > **代码版本**: v1.1.0 (commit 9a362ec)
 > **分析范围**: expert 多时刻监督、WindowSample 强类型化、validation loop 落地、LR scale 接入 optimizer
+>
+> **修订说明**: v2 修正 Expert 多时刻监督的优先级判断。初版将其列为 P1，经深入论证（动作块 95.8% 重叠、与 pi-0 SOTA 一致、Stage B detach 设计）后下调至 P3，作为训练后 ablation 选项。
 
 ---
 
@@ -129,17 +131,77 @@ losses["loss_fm"] = torch.stack(losses_fm).mean()
 | 训练时间 / epoch | 基线 | ~5-6× | ~2× |
 | 实现复杂度 | — | 低 | 中（需配置项） |
 
-### 1.5 结论
+### 1.5 再审视：真的需要多时刻 expert 监督吗？
 
-**Expert 多时刻监督是一个真实的设计空缺**。推荐方案 C（随机采样 K 个时刻），在梯度密度和计算开销之间取得平衡。需要：
+初版分析将此问题列为 P1。经深入论证后，结论修正为 **当前阶段不需要实现**。
 
-1. 在 `TrainConfig` 中添加 `expert_supervision_steps: int = 1`（默认保持现状）
-2. 在 `forward_train()` 中用 `torch.randperm(T)[:K]` 采样
-3. 为每个采样时刻构建 `cond_prefix`，跑 expert forward
-4. 梯度幅度增大 ~√K 倍，可能需要调低 `expert_lr_scale`
-5. 需新增测试验证多时刻 loss 计算正确性
+#### 支持"维持 t=-1"的论点
 
-**风险等级**：中 — 计算开销可控但需要显存监控
+**1. 架构设计意图本身就是 t=-1**
+
+Flow matching expert 的职责是：给定当前条件前缀（cond_prefix），去噪生成一个 24 步动作块。推理时 expert 只在最新状态下调用，训练用 t=-1 与推理对齐。这不是偶然的简化，而是有意的设计选择。
+
+FAST/Phase/Affordance 头是轻量 MLP（几万参数），全 T 监督的增量计算几乎为零。Expert 是 18 层 1536d 的重型网络（~350M 参数），两者的全 T 代价差 3-4 个数量级。将它们类比是不恰当的。
+
+**2. 窗口内动作块高度重叠——多时刻信号近乎冗余**
+
+当前配置 `sequence_window (T) = 24`，`chunk_horizon (H) = 24`。相邻时刻的动作块：
+
+```
+actions[t]   = raw[t   : t+24]
+actions[t+1] = raw[t+1 : t+25]
+重叠 = 23/24 = 95.8%
+```
+
+多时刻监督提供的不是"T 倍更多的信息"，而是"T 个 95.8% 重叠的信号"。有效信息增益远低于 T 倍。相邻时刻的 cond_prefix 也高度相似（同一抓取动作的连续帧），梯度方向近乎平行。
+
+**3. pi-0 等 SOTA 方法同样是单时刻监督**
+
+pi-0（Physical Intelligence）的 flow matching expert 在单个时刻计算 loss。这不是 HybridVLA 的独特缺陷，而是 flow matching action expert 的标准做法。没有已发表的工作证明多时刻 expert 监督能显著提升性能。
+
+**4. Stage B 的 cond_prefix.detach() 进一步削弱了多时刻的意义**
+
+Stage B 配置为 `stop_gradient_cond_prefix: true` + `block_fm_to_backbone: true`，expert 梯度不回传到 Temporal Core。在这种设计下，多时刻监督的唯一收益是"expert 自身看到更多条件变体"。但由于动作块 95.8% 重叠，这些"变体"几乎相同。Stage C 虽然放开了梯度，但只有 80K 步，此时 expert 已从 Stage B 的 200K 步中充分学习。
+
+**5. 梯度密度不足可以通过更廉价的手段补偿**
+
+- 增大 batch size（通过梯度累积，已有 `no_sync()` 优化）
+- 调高 `expert_lr_scale`（当前 0.5，可尝试 0.7-1.0）
+- 延长 Stage B 训练步数
+- 以上都不增加单步计算量
+
+**6. 计算代价不容忽视**
+
+即使方案 C（K=4），训练时间 ~2×，显存逼近 80GB 上限。Stage B 的 200K 步 × 2 = 多出数天 H100 时间，而收益不确定。
+
+#### 支持"需要"的论点
+
+**1. Temporal Core 中间状态缺少 expert 级梯度反馈**
+
+FAST 头在全 T 监督下将梯度回传到 `fused_states` 的每个时刻，帮助 Temporal Core 学习有意义的中间表示。Expert 梯度只从 t=-1 的 cond_prefix 回传（Stage B 还 detach 了）。Temporal Core 可能为离散头优化而非为 expert 优化。
+
+**反驳**：这是一个真实的理论风险，但 FAST 头和 expert 都监督同一种目标（动作预测），方向一致。consistency loss 进一步对齐两者。且 Stage C 端到端微调时梯度会重新流通。
+
+**2. 一致性损失只在 t=-1 对齐**
+
+如果 FAST 在 t=0..T-2 学到的表示与 expert 在 t=-1 学到的不一致，consistency loss 无法弥合。
+
+**反驳**：同上，这是理论风险。需要实际 loss 曲线来判断是否触发。
+
+### 1.6 修正结论
+
+**当前阶段不需要实现多时刻 expert 监督。优先级从 P1 下调至 P3。**
+
+正确的策略是数据驱动：
+
+1. 先用 t=-1 跑完 Stage A → B（~320K 步）
+2. 观察 `loss_fm` 曲线：
+   - 正常下降 → 不需要多时刻监督
+   - 停滞/震荡 → 先尝试调 `expert_lr_scale`（0.7-1.0）和增大有效 batch size
+   - 以上无效 → 再考虑 K=2~4 的多时刻监督作为 ablation
+3. 多时刻监督作为 **ablation 实验选项**而非默认配置
+
+**风险等级**：低 — 当前设计与 SOTA 一致，无需预优化
 
 ---
 
@@ -461,36 +523,43 @@ optim group expert_decay      ZZZ params  lr=5.00e-05  wd=0.0100
 
 | 问题 | 现状 | 风险 | 行动建议 |
 |------|------|------|---------|
-| **Expert 多时刻监督** | 仅 t=-1，与离散头不对称 | **中** | 实现方案 C（随机采样 K 个时刻），添加 `expert_supervision_steps` 配置项 |
-| **WindowSample 强类型化** | dataclass 存在但未使用，全链路 plain dict | **中** | 短期在 collate 加前置校验；中期重构 adapter 返回 WindowSample 实例 |
+| **Expert 多时刻监督** | 仅 t=-1，与 SOTA 一致 | **低** | 不实现。训练后根据 `loss_fm` 曲线决定是否做 ablation |
+| **WindowSample 强类型化** | dataclass 存在但未使用，全链路 plain dict | **中** | 训练前在 collate 加前置校验；训练后重构 adapter 返回类型 |
 | **Validation loop 落地** | **已完整实现** | **低** | 可选改进：`max_batches` 可配置、best-loss checkpoint、指标持久化 |
 | **LR scale 接入 optimizer** | **已完整实现并测试** | **无** | 无需改动 |
 
-### 优先级排序
+### 优先级排序（修正版）
 
 ```
-P1 — Expert 多时刻监督（方案 C）
-     理由：直接影响训练效果，expert 梯度密度不足是实际训练的瓶颈
-     工作量：~50 行代码改动 + 配置项 + 测试
-
-P2 — WindowSample collate 前置校验（方案 C 短期）
-     理由：防止静默错误，改动极小
+P1 — WindowSample collate 前置校验
+     理由：防止数据管线静默错误，真实数据比 dummy 更容易触发
      工作量：~10 行代码
+     时机：训练前
 
-P3 — WindowSample adapter 返回类型重构（方案 A 中期）
-     理由：类型安全提升，但当前 _validate_batch() 已覆盖高危场景
-     工作量：~100 行跨 4 个文件
-
-P4 — Validation loop 增强（max_batches 可配置、best checkpoint）
-     理由：锦上添花
+P2 — Validation loop 增强（max_batches 可配置、best checkpoint）
+     理由：首轮训练需要追踪 val loss 选最优检查点
      工作量：~30 行
+     时机：训练前可选
+
+P3 — Expert 多时刻监督（方案 C，ablation）
+     理由：当前设计与 pi-0 一致，动作块 95.8% 重叠使多时刻信号冗余
+     前置条件：loss_fm 停滞 + 调 LR/batch 无效后再考虑
+     工作量：~50 行代码 + 配置项 + 测试
+     时机：Stage B 训练后视数据决定
+
+P4 — WindowSample adapter 返回类型重构
+     理由：类型安全提升，但 _validate_batch() 已覆盖高危场景
+     工作量：~100 行跨 4 个文件
+     时机：训练跑通后
 
 P5 — LR scale（无需操作）
 ```
 
 ### 开始训练前的必要改动
 
-如果即将上 HPC 开始实际训练，**P1 和 P2 应在训练前完成**：
+**仅 P1 是训练前的硬性要求**：
 
-- **P1**：expert 梯度密度直接影响 Stage B/C 收敛质量，上线后再改需要重跑
-- **P2**：数据管线的静默错误在真实数据上更容易触发，debug 成本远高于预防成本
+- **P1**：数据管线的静默错误（key 拼写、字段缺失）在真实 LIBERO 数据上更容易触发，debug 成本远高于 10 行校验代码
+- **P2**：可选但推荐——首轮训练的 val loss 趋势是后续所有决策的基础
+
+**P3（Expert 多时刻监督）不应在首轮训练前实现**——连 t=-1 的收敛曲线都没有，无法判断 expert 梯度密度是否是瓶颈。正确做法是先跑通 320K 步，用数据说话。
